@@ -162,7 +162,7 @@ async def send_message(message_data: MessageCreate):
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            max_tokens=1000
+            max_tokens=200
         )
         ai_response = response.choices[0].message.content
     except Exception as e:
