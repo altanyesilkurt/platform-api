@@ -57,7 +57,7 @@ def generate_chat_title(user_message: str, ai_response: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": "Generate a very short title (3-6 words max) for this conversation. Return ONLY the title, no quotes, no punctuation at the end."
+                    "content": "Generate a short title (3-6 words max) for this conversation. Return ONLY the title, no quotes, no punctuation at the end."
                 },
                 {
                     "role": "user",
@@ -219,7 +219,7 @@ async def send_message_stream(message_data: MessageCreate):
             stream = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                max_tokens=1000,
+                max_tokens=200,
                 stream=True
             )
             for chunk in stream:
