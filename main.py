@@ -6,9 +6,6 @@ from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
 from openai import OpenAI
 from dotenv import load_dotenv
-from promts.chat_with_pr_contect_prompt import CHAT_WITH_PR_CONTEXT_PROMPT
-from promts.pr_analysis_system_prompt import PR_ANALYSIS_SYSTEM_PROMPT
-
 import os
 import json
 import re
@@ -66,6 +63,70 @@ class PRAnalysisResponse(BaseModel):
 
 # GitHub PR URL pattern
 PR_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)'
+
+# System prompts
+PR_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Pull Requests thoroughly and provide actionable insights.
+
+IMPORTANT: Always respond in plain text with markdown formatting. Do NOT return JSON.
+
+Structure your analysis like this:
+
+## Summary
+A clear, concise summary of what this PR does (2-3 sentences)
+
+## Risk Assessment
+**Risk Level:** [Low/Medium/High/Critical]
+
+Risk Level Guidelines:
+- Low: Minor changes, documentation, small bug fixes, no breaking changes
+- Medium: New features, refactoring, changes to non-critical paths
+- High: Changes to core functionality, database migrations, API changes, security-related code
+- Critical: Breaking changes, security vulnerabilities, data migration risks
+
+**Risk Details:**
+- List specific risks identified
+
+## Key Changes
+- List the most important changes
+
+## Code Quality
+- Notes on code quality, patterns, or concerns
+
+## Suggestions
+- Actionable suggestions for improvement
+
+## Breaking Changes
+- List potential breaking changes (or "None identified" if none)
+
+Be thorough but concise. Focus on actionable insights."""
+
+CHAT_WITH_PR_CONTEXT_PROMPT = """You are a Senior Software Engineer assistant helping with GitHub PR reviews. You have context about a specific PR and should answer questions about it.
+
+When discussing PRs:
+- Be specific and reference actual code changes when possible
+- Highlight potential issues or risks
+- Suggest improvements constructively
+- Consider security, performance, and maintainability
+- If asked about breaking changes, analyze API changes, database changes, and dependency updates
+
+IMPORTANT: Always respond in plain text with markdown formatting. Do NOT return JSON. Use headers, bullet points, and code blocks for clarity.
+
+Structure your response like this:
+## Summary
+Brief overview of the PR
+
+## Key Changes
+- List important changes
+
+## Risk Assessment
+**Risk Level:** Low/Medium/High/Critical
+- Specific risks identified
+
+## Suggestions
+- Actionable improvements
+
+## Breaking Changes (if any)
+- List potential breaking changes"""
 
 
 async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
@@ -429,14 +490,15 @@ async def send_message_stream(message_data: MessageCreate):
                     "author": commit_info.get("author", {}).get("name", "Unknown")
                 })
 
-            # Extract files
+            # Extract files with patches
             files = []
             for f in pr_data.get("files", [])[:20]:
                 files.append({
                     "filename": f.get("filename", ""),
                     "status": f.get("status", ""),
                     "additions": f.get("additions", 0),
-                    "deletions": f.get("deletions", 0)
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""  # Limit patch size
                 })
 
             pr_metadata = {
