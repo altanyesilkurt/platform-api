@@ -321,7 +321,7 @@ async def analyze_pr_with_ai(pr_context: str, user_query: str, is_structured: bo
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_query}"}
         ],
-        max_tokens=2000,
+        max_tokens=200,
         temperature=0.3
     )
     return response.choices[0].message.content
@@ -428,7 +428,7 @@ async def send_message(message_data: MessageCreate):
 
         try:
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini", messages=messages, max_tokens=1500
+                model="gpt-4o-mini", messages=messages, max_tokens=200
             )
             ai_response = response.choices[0].message.content
         except Exception as e:
@@ -576,7 +576,7 @@ async def send_message_stream(message_data: MessageCreate):
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
 
             stream = openai_client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=2000, stream=True
+                model="gpt-4o", messages=messages, max_tokens=200, stream=True
             )
             for chunk in stream:
                 if chunk.choices[0].delta.content:
@@ -601,6 +601,118 @@ async def send_message_stream(message_data: MessageCreate):
         generate(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     )
+
+
+class PRReviewRequest(BaseModel):
+    pr_url: str
+    review_type: str = Field(..., pattern="^(COMMENT|APPROVE|REQUEST_CHANGES)$")
+    body: str = Field(default="")
+
+
+@app.post("/pr/review")
+async def submit_pr_review(review: PRReviewRequest):
+    """Submit a review to a GitHub PR (Comment, Approve, or Request Changes)."""
+    pr_info = extract_pr_url(review.pr_url)
+    if not pr_info:
+        raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
+
+    if not GITHUB_TOKEN:
+        raise HTTPException(status_code=401, detail="GitHub token not configured. Add GITHUB_TOKEN to your .env file.")
+
+    owner, repo, pr_number = pr_info
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "User-Agent": "PR-Assistant"
+    }
+
+    # GitHub API requires a body for REQUEST_CHANGES
+    if review.review_type == "REQUEST_CHANGES" and not review.body.strip():
+        raise HTTPException(status_code=400, detail="A comment is required when requesting changes.")
+
+    review_data = {
+        "event": review.review_type,
+    }
+
+    # Only include body if provided
+    if review.body.strip():
+        review_data["body"] = review.body
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+            response = await client.post(url, headers=headers, json=review_data)
+
+            if response.status_code == 200 or response.status_code == 201:
+                result = response.json()
+                return {
+                    "success": True,
+                    "review_id": result.get("id"),
+                    "state": result.get("state"),
+                    "message": f"Review submitted successfully as '{review.review_type}'"
+                }
+            elif response.status_code == 422:
+                error_data = response.json()
+                error_msg = error_data.get("message", "Validation failed")
+                # Common issue: can't approve your own PR
+                if "Can not approve your own pull request" in str(error_data):
+                    raise HTTPException(status_code=422, detail="You cannot approve your own pull request.")
+                raise HTTPException(status_code=422, detail=f"GitHub validation error: {error_msg}")
+            elif response.status_code == 404:
+                raise HTTPException(status_code=404, detail="PR not found or you don't have access.")
+            elif response.status_code == 403:
+                raise HTTPException(status_code=403,
+                                    detail="Permission denied. Your token may not have write access to this repository.")
+            else:
+                raise HTTPException(status_code=response.status_code, detail=f"GitHub API error: {response.text}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to submit review: {str(e)}")
+
+
+@app.post("/pr/comment")
+async def add_pr_comment(pr_url: str, body: str):
+    """Add a general comment to a PR (not a review)."""
+    pr_info = extract_pr_url(pr_url)
+    if not pr_info:
+        raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
+
+    if not GITHUB_TOKEN:
+        raise HTTPException(status_code=401, detail="GitHub token not configured.")
+
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="Comment body is required.")
+
+    owner, repo, pr_number = pr_info
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "User-Agent": "PR-Assistant"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Use issues API for general comments (PRs are issues in GitHub)
+            url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+            response = await client.post(url, headers=headers, json={"body": body})
+
+            if response.status_code == 201:
+                result = response.json()
+                return {
+                    "success": True,
+                    "comment_id": result.get("id"),
+                    "html_url": result.get("html_url"),
+                    "message": "Comment added successfully"
+                }
+            else:
+                raise HTTPException(status_code=response.status_code, detail=f"GitHub API error: {response.text}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add comment: {str(e)}")
 
 
 # Direct PR Analysis endpoint
