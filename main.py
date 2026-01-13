@@ -61,17 +61,19 @@ class PRAnalysisResponse(BaseModel):
     lines_deleted: int
 
 
-# GitHub PR URL pattern
+# GitHub URL patterns
 PR_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)'
+COMMIT_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+)'
 
-# Keywords that indicate PR/code review related queries
+# Keywords that indicate PR/code review/commit related queries
 PR_RELATED_KEYWORDS = [
     'pull request', 'pr', 'code review', 'github', 'merge', 'commit', 'branch',
     'diff', 'repository', 'repo', 'git', 'review this', 'analyze this pr',
     'check this pr', 'look at this pr', 'examine this', 'code changes',
     'file changes', 'breaking changes', 'risk assessment', 'code analysis',
-    '/pull/', 'github.com', 'approve', 'request changes', 'mergeable',
-    'conflicts', 'base branch', 'head branch', 'squash', 'rebase'
+    '/pull/', '/commit/', 'github.com', 'approve', 'request changes', 'mergeable',
+    'conflicts', 'base branch', 'head branch', 'squash', 'rebase',
+    'analyze commit', 'review commit', 'commit changes', 'sha'
 ]
 
 # System prompts
@@ -266,14 +268,16 @@ END EXAMPLE
 Remember: NO BULLET POINTS, NO NUMBERED LISTS. Only headers (## and ###) and paragraphs with inline **bold** text."""
 
 
-
-
 def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
-    """Determine if the query is related to GitHub PR/code review."""
+    """Determine if the query is related to GitHub PR/code review/commit."""
     message_lower = message.lower()
 
     # Check for PR URL in the message
     if re.search(PR_URL_PATTERN, message):
+        return True
+
+    # Check for Commit URL in the message
+    if re.search(COMMIT_URL_PATTERN, message):
         return True
 
     # Check for PR-related keywords
@@ -281,14 +285,17 @@ def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
         if keyword in message_lower:
             return True
 
-    # Check conversation history for PR context
+    # Check conversation history for PR/commit context
     if chat_history:
         for msg in chat_history[-5:]:  # Check last 5 messages
             content = msg.get("content", "").lower()
             if re.search(PR_URL_PATTERN, content):
                 return True
-            # If recent conversation mentions PR-specific terms
-            if any(kw in content for kw in ['pull request', 'github.com/pull', 'pr #', 'this pr']):
+            if re.search(COMMIT_URL_PATTERN, content):
+                return True
+            # If recent conversation mentions PR/commit-specific terms
+            if any(kw in content for kw in
+                   ['pull request', 'github.com/pull', 'pr #', 'this pr', 'this commit', 'commit sha']):
                 return True
 
     return False
@@ -405,6 +412,157 @@ def extract_pr_url(message: str) -> Optional[tuple]:
         return result
     print(f"No PR URL found in message: {message[:100]}...")
     return None
+
+
+def extract_commit_url(message: str) -> Optional[tuple]:
+    """Extract GitHub Commit URL from message."""
+    match = re.search(COMMIT_URL_PATTERN, message)
+    if match:
+        result = (match.group(1), match.group(2), match.group(3))
+        print(f"Extracted Commit URL: owner={result[0]}, repo={result[1]}, sha={result[2]}")
+        return result
+    return None
+
+
+async def fetch_github_commit(owner: str, repo: str, commit_sha: str) -> Dict[str, Any]:
+    """Fetch commit details from GitHub API."""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "PR-Assistant"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    else:
+        print("WARNING: No GITHUB_TOKEN set. API rate limits will be very restrictive.")
+
+    print(f"Fetching Commit: {owner}/{repo}@{commit_sha[:7]}")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            commit_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{commit_sha}"
+            commit_response = await client.get(commit_url, headers=headers)
+
+            print(f"GitHub Commit response status: {commit_response.status_code}")
+
+            if commit_response.status_code == 404:
+                raise HTTPException(status_code=404,
+                                    detail=f"Commit {commit_sha[:7]} not found in {owner}/{repo}.")
+            elif commit_response.status_code == 403:
+                error_data = commit_response.json() if commit_response.text else {}
+                if "rate limit" in error_data.get("message", "").lower():
+                    raise HTTPException(status_code=403,
+                                        detail="GitHub API rate limit exceeded.")
+                raise HTTPException(status_code=403,
+                                    detail=f"Access denied to {owner}/{repo}.")
+            elif commit_response.status_code != 200:
+                raise HTTPException(status_code=commit_response.status_code,
+                                    detail=f"GitHub API error: {commit_response.text[:200]}")
+
+            commit_data = commit_response.json()
+
+            if not commit_data:
+                raise HTTPException(status_code=500, detail="GitHub returned empty commit data")
+
+            return {
+                "commit": commit_data,
+                "url": f"https://github.com/{owner}/{repo}/commit/{commit_sha}"
+            }
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504,
+                            detail=f"Request to GitHub timed out.")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Network error connecting to GitHub: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error in fetch_github_commit: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+def format_commit_context(commit_data: Dict[str, Any]) -> str:
+    """Format commit data for AI context."""
+    commit = commit_data.get("commit", {})
+    commit_info = commit.get("commit", {})
+    author = commit_info.get("author", {})
+    committer = commit_info.get("committer", {})
+    stats = commit.get("stats", {})
+    files = commit.get("files", [])
+
+    files_summary = "\n".join([
+        f"- `{f.get('filename', 'unknown')}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)}) [{f.get('status', 'unknown')}]"
+        for f in (files or [])[:30]
+    ]) or "No files information available"
+
+    # Build patches summary
+    patches_summary = ""
+    for f in (files or [])[:10]:
+        patch = f.get("patch", "")
+        if patch:
+            patches_summary += f"\n### `{f.get('filename', 'unknown')}`\n```diff\n{patch[:3000]}\n```\n"
+
+    return f"""
+## Commit: {commit_info.get('message', 'No message')[:200]}
+
+**URL:** {commit_data.get('url', 'N/A')}
+**SHA:** {commit.get('sha', 'unknown')}
+**Author:** {author.get('name', 'Unknown')} <{author.get('email', '')}>
+**Date:** {author.get('date', 'N/A')}
+**Committer:** {committer.get('name', 'Unknown')}
+
+### Full Commit Message:
+{commit_info.get('message', 'No message provided')}
+
+### Statistics:
+- Files Changed: {len(files) if files else 0}
+- Additions: {stats.get('additions', 0)}
+- Deletions: {stats.get('deletions', 0)}
+- Total Changes: {stats.get('total', 0)}
+
+### Files Changed:
+{files_summary}
+
+### Code Changes:
+{patches_summary if patches_summary else 'No patch data available'}
+"""
+
+
+COMMIT_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Commits thoroughly and provide actionable insights.
+
+Structure your response EXACTLY like this format (with blank lines between sections):
+
+## Summary
+
+A clear, concise summary of what this commit does (2-3 sentences).
+
+## Key Changes
+
+Describe the main changes made in this commit. Use ### subsections for each file or logical group of changes.
+
+### `filename.ext`
+
+Explain what was changed in this file and why it matters.
+
+## Code Quality
+
+Evaluate the code quality, patterns used, and any concerns.
+
+## Risk Assessment
+
+**Risk Level:** Low/Medium/High/Critical
+
+Explain any risks associated with this commit.
+
+## Suggestions
+
+Provide actionable suggestions for improvement if applicable.
+
+CRITICAL FORMATTING RULES:
+1. Use ## for main section headers
+2. Use ### for subsections and file names
+3. Use `backticks` for file names, function names, variable names
+4. Use **bold** for important terms and risk levels
+5. Use code blocks with language specification for code snippets
+6. Write in flowing paragraphs, avoid bullet points where possible"""
 
 
 def format_pr_context(pr_data: Dict[str, Any]) -> str:
@@ -642,10 +800,16 @@ async def send_message_stream(message_data: MessageCreate):
 
     # Check for PR URL
     pr_info = extract_pr_url(user_message)
-    pr_context = None
-    pr_metadata = None
-    pr_fetch_error = None
+    # Check for Commit URL
+    commit_info = extract_commit_url(user_message)
 
+    pr_context = None
+    commit_context = None
+    pr_metadata = None
+    commit_metadata = None
+    fetch_error = None
+
+    # Handle PR URL
     if pr_info:
         owner, repo, pr_number = pr_info
         try:
@@ -657,12 +821,12 @@ async def send_message_stream(message_data: MessageCreate):
 
             # Extract commits
             commits = []
-            for commit in pr_data.get("commits", [])[:10]:
-                commit_info = commit.get("commit", {})
+            for c in pr_data.get("commits", [])[:10]:
+                c_info = c.get("commit", {})
                 commits.append({
-                    "sha": commit.get("sha", "")[:7],
-                    "message": commit_info.get("message", "").split("\n")[0][:100],
-                    "author": commit_info.get("author", {}).get("name", "Unknown")
+                    "sha": c.get("sha", "")[:7],
+                    "message": c_info.get("message", "").split("\n")[0][:100],
+                    "author": c_info.get("author", {}).get("name", "Unknown")
                 })
 
             # Extract files with patches
@@ -673,7 +837,7 @@ async def send_message_stream(message_data: MessageCreate):
                     "status": f.get("status", ""),
                     "additions": f.get("additions", 0),
                     "deletions": f.get("deletions", 0),
-                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""  # Limit patch size
+                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
                 })
 
             pr_metadata = {
@@ -690,7 +854,6 @@ async def send_message_stream(message_data: MessageCreate):
                 "files": files
             }
 
-            # Check if PR is closed or merged - skip analysis
             if pr_state == "closed" or pr_merged:
                 merged_by = (pr.get("merged_by") or {}).get("login", "")
                 if pr_merged:
@@ -698,15 +861,62 @@ async def send_message_stream(message_data: MessageCreate):
                 else:
                     status_message = "This PR has been closed without merging. No analysis needed."
                 pr_metadata["status_message"] = status_message
-                pr_context = None  # Skip analysis
+                pr_context = None
 
             print(f"Successfully fetched PR: {pr_metadata['pr_title']} (state: {pr_state}, merged: {pr_merged})")
         except HTTPException as e:
             print(f"HTTP ERROR fetching PR: {e.detail}")
-            pr_fetch_error = e.detail
+            fetch_error = e.detail
         except Exception as e:
             print(f"ERROR fetching PR: {str(e)}")
-            pr_fetch_error = str(e)
+            fetch_error = str(e)
+
+    # Handle Commit URL
+    elif commit_info:
+        owner, repo, commit_sha = commit_info
+        try:
+            commit_data = await fetch_github_commit(owner, repo, commit_sha)
+            commit_context = format_commit_context(commit_data)
+            commit = commit_data.get("commit", {})
+            commit_info_data = commit.get("commit", {})
+            author = commit_info_data.get("author", {})
+            stats = commit.get("stats", {})
+            files = commit.get("files", [])
+
+            # Extract files with patches for metadata
+            files_list = []
+            for f in (files or [])[:20]:
+                files_list.append({
+                    "filename": f.get("filename", ""),
+                    "status": f.get("status", ""),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
+                })
+
+            commit_metadata = {
+                "type": "commit",
+                "commit_url": commit_data.get("url"),
+                "commit_sha": commit.get("sha", "")[:7],
+                "commit_sha_full": commit.get("sha", ""),
+                "commit_message": commit_info_data.get("message", ""),  # Full message including description
+                "commit_author": author.get("name", "Unknown"),
+                "commit_author_email": author.get("email", ""),
+                "commit_date": author.get("date", ""),
+                "files_changed": len(files) if files else 0,
+                "additions": stats.get("additions", 0),
+                "deletions": stats.get("deletions", 0),
+                "total_changes": stats.get("total", 0),
+                "files": files_list
+            }
+
+            print(f"Successfully fetched Commit: {commit_metadata['commit_sha']} - {commit_metadata['commit_message']}")
+        except HTTPException as e:
+            print(f"HTTP ERROR fetching Commit: {e.detail}")
+            fetch_error = e.detail
+        except Exception as e:
+            print(f"ERROR fetching Commit: {str(e)}")
+            fetch_error = str(e)
 
     history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
 
@@ -716,6 +926,14 @@ async def send_message_stream(message_data: MessageCreate):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_message}"}
+        ]
+        max_tokens = 2000
+    elif commit_context:
+        system_prompt = COMMIT_ANALYSIS_SYSTEM_PROMPT
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",
+             "content": f"{commit_context}\n\n---\n\nUser Request: Analyze this commit and provide insights."}
         ]
         max_tokens = 2000
     else:
@@ -735,9 +953,9 @@ async def send_message_stream(message_data: MessageCreate):
     async def generate():
         full_response = ""
         try:
-            # Handle PR fetch error
-            if pr_info and pr_fetch_error:
-                error_msg = f"Unable to fetch the PR from GitHub. {pr_fetch_error}"
+            # Handle fetch error
+            if (pr_info or commit_info) and fetch_error:
+                error_msg = f"Unable to fetch from GitHub. {fetch_error}"
                 yield f"data: {json.dumps({'content': error_msg})}\n\n"
 
                 result = supabase.table("messages").insert({
@@ -746,7 +964,7 @@ async def send_message_stream(message_data: MessageCreate):
                 yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
                 return
 
-            # Handle closed/merged PR - just show status, no analysis
+            # Handle closed/merged PR
             if pr_metadata and pr_metadata.get("status_message"):
                 status_msg = pr_metadata["status_message"]
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
@@ -758,9 +976,11 @@ async def send_message_stream(message_data: MessageCreate):
                 yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
                 return
 
-            # Send PR metadata first if available
+            # Send metadata first if available
             if pr_metadata:
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
+            elif commit_metadata:
+                yield f"data: {json.dumps({'commit_metadata': commit_metadata})}\n\n"
 
             stream = openai_client.chat.completions.create(
                 model="gpt-4o", messages=messages, max_tokens=max_tokens, stream=True
@@ -943,6 +1163,49 @@ async def analyze_pr(pr_url: str, analysis_type: str = "full"):
             "deletions": pr.get("deletions", 0)
         },
         "analysis": parsed
+    }
+
+
+# Direct Commit Analysis endpoint
+@app.post("/analyze-commit")
+async def analyze_commit(commit_url: str):
+    """Direct endpoint for commit analysis without chat context."""
+    commit_info = extract_commit_url(commit_url)
+    if not commit_info:
+        raise HTTPException(status_code=400,
+                            detail="Invalid GitHub Commit URL. Expected format: https://github.com/owner/repo/commit/sha")
+
+    owner, repo, commit_sha = commit_info
+    commit_data = await fetch_github_commit(owner, repo, commit_sha)
+    commit_context = format_commit_context(commit_data)
+    commit = commit_data.get("commit", {})
+    commit_info_data = commit.get("commit", {})
+    author = commit_info_data.get("author", {})
+    stats = commit.get("stats", {})
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": COMMIT_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{commit_context}\n\n---\n\nAnalyze this commit and provide insights."}
+        ],
+        max_tokens=2000,
+        temperature=0.3
+    )
+    analysis = response.choices[0].message.content
+
+    return {
+        "commit_url": commit_data.get("url", commit_url),
+        "commit_sha": commit.get("sha", "")[:7],
+        "commit_message": commit_info_data.get("message", "").split("\n")[0],
+        "author": author.get("name", "Unknown"),
+        "date": author.get("date", ""),
+        "stats": {
+            "files_changed": len(commit.get("files", [])),
+            "additions": stats.get("additions", 0),
+            "deletions": stats.get("deletions", 0)
+        },
+        "analysis": {"response": analysis}
     }
 
 
