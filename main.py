@@ -13,13 +13,11 @@ import httpx
 
 load_dotenv()
 
-# Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Add this to your .env
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# Initialize clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -35,7 +33,6 @@ app.add_middleware(
 )
 
 
-# Pydantic Models
 class ChatCreate(BaseModel):
     title: str = Field(default="New Chat", max_length=200)
 
@@ -51,7 +48,7 @@ class MessageCreate(BaseModel):
 
 class PRAnalysisResponse(BaseModel):
     summary: str
-    risk_level: str  # low, medium, high, critical
+    risk_level: str
     risk_details: List[str]
     key_changes: List[str]
     suggestions: List[str]
@@ -76,7 +73,6 @@ PR_RELATED_KEYWORDS = [
     'analyze commit', 'review commit', 'commit changes', 'sha'
 ]
 
-# System prompts
 PR_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Pull Requests thoroughly and provide actionable insights.
 
 IMPORTANT: Always respond in plain text with markdown formatting. Do NOT return JSON.
@@ -267,6 +263,44 @@ END EXAMPLE
 
 Remember: NO BULLET POINTS, NO NUMBERED LISTS. Only headers (## and ###) and paragraphs with inline **bold** text."""
 
+COMMIT_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Commits thoroughly and provide actionable insights.
+
+Structure your response EXACTLY like this format (with blank lines between sections):
+
+## Summary
+
+A clear, concise summary of what this commit does (2-3 sentences).
+
+## Key Changes
+
+Describe the main changes made in this commit. Use ### subsections for each file or logical group of changes.
+
+### `filename.ext`
+
+Explain what was changed in this file and why it matters.
+
+## Code Quality
+
+Evaluate the code quality, patterns used, and any concerns.
+
+## Risk Assessment
+
+**Risk Level:** Low/Medium/High/Critical
+
+Explain any risks associated with this commit.
+
+## Suggestions
+
+Provide actionable suggestions for improvement if applicable.
+
+CRITICAL FORMATTING RULES:
+1. Use ## for main section headers
+2. Use ### for subsections and file names
+3. Use `backticks` for file names, function names, variable names
+4. Use **bold** for important terms and risk levels
+5. Use code blocks with language specification for code snippets
+6. Write in flowing paragraphs, avoid bullet points where possible"""
+
 
 def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
     """Determine if the query is related to GitHub PR/code review/commit."""
@@ -302,7 +336,6 @@ def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
 
 
 async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
-    """Fetch PR details from GitHub API."""
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "PR-Assistant"
@@ -316,7 +349,6 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Fetch PR details
             pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
             pr_response = await client.get(pr_url, headers=headers)
 
@@ -343,7 +375,6 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
 
             print(f"PR Title: {pr_data.get('title', 'N/A')}, State: {pr_data.get('state', 'N/A')}")
 
-            # Fetch PR diff
             diff_content = ""
             try:
                 diff_headers = {**headers, "Accept": "application/vnd.github.v3.diff"}
@@ -524,46 +555,6 @@ def format_commit_context(commit_data: Dict[str, Any]) -> str:
 ### Code Changes:
 {patches_summary if patches_summary else 'No patch data available'}
 """
-
-
-COMMIT_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Commits thoroughly and provide actionable insights.
-
-Structure your response EXACTLY like this format (with blank lines between sections):
-
-## Summary
-
-A clear, concise summary of what this commit does (2-3 sentences).
-
-## Key Changes
-
-Describe the main changes made in this commit. Use ### subsections for each file or logical group of changes.
-
-### `filename.ext`
-
-Explain what was changed in this file and why it matters.
-
-## Code Quality
-
-Evaluate the code quality, patterns used, and any concerns.
-
-## Risk Assessment
-
-**Risk Level:** Low/Medium/High/Critical
-
-Explain any risks associated with this commit.
-
-## Suggestions
-
-Provide actionable suggestions for improvement if applicable.
-
-CRITICAL FORMATTING RULES:
-1. Use ## for main section headers
-2. Use ### for subsections and file names
-3. Use `backticks` for file names, function names, variable names
-4. Use **bold** for important terms and risk levels
-5. Use code blocks with language specification for code snippets
-6. Write in flowing paragraphs, avoid bullet points where possible"""
-
 
 def format_pr_context(pr_data: Dict[str, Any]) -> str:
     """Format PR data for AI context."""
