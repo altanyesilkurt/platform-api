@@ -64,41 +64,76 @@ class PRAnalysisResponse(BaseModel):
 # GitHub PR URL pattern
 PR_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)'
 
+# Keywords that indicate PR/code review related queries
+PR_RELATED_KEYWORDS = [
+    'pull request', 'pr', 'code review', 'github', 'merge', 'commit', 'branch',
+    'diff', 'repository', 'repo', 'git', 'review this', 'analyze this pr',
+    'check this pr', 'look at this pr', 'examine this', 'code changes',
+    'file changes', 'breaking changes', 'risk assessment', 'code analysis',
+    '/pull/', 'github.com', 'approve', 'request changes', 'mergeable',
+    'conflicts', 'base branch', 'head branch', 'squash', 'rebase'
+]
+
 # System prompts
 PR_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Software Engineer and expert code reviewer. Analyze GitHub Pull Requests thoroughly and provide actionable insights.
 
 IMPORTANT: Always respond in plain text with markdown formatting. Do NOT return JSON.
 
-Structure your analysis like this:
+Structure your analysis EXACTLY like this format (with blank lines between sections):
 
 ## Summary
+
 A clear, concise summary of what this PR does (2-3 sentences)
 
-## Risk Assessment
-**Risk Level:** [Low/Medium/High/Critical]
-
-Risk Level Guidelines:
-- Low: Minor changes, documentation, small bug fixes, no breaking changes
-- Medium: New features, refactoring, changes to non-critical paths
-- High: Changes to core functionality, database migrations, API changes, security-related code
-- Critical: Breaking changes, security vulnerabilities, data migration risks
-
-**Risk Details:**
-- List specific risks identified
-
 ## Key Changes
-- List the most important changes
 
-## Code Quality
-- Notes on code quality, patterns, or concerns
+- First key change with *className* or *variableName* in italics
+- Second key change
+
+**Code Added/Modified:**
+
+```java
+// Show the actual code that was changed
+boolean nameOrEmailChanged = !user.getEmail().equals(userDTO.getEmail());
+```
+
+## Risk Assessment
+
+**Risk Level:** Low/Medium/High/Critical
+
+- First risk detail
+- Second risk detail
 
 ## Suggestions
-- Actionable suggestions for improvement
+
+- First suggestion
+- Second suggestion
 
 ## Breaking Changes
-- List potential breaking changes (or "None identified" if none)
 
-Be thorough but concise. Focus on actionable insights."""
+- List breaking changes or "None identified"
+
+Be thorough but concise. Focus on actionable insights.
+
+CRITICAL FORMATTING RULES:
+1. ALWAYS use ## for section headers (## Summary, ## Key Changes, etc.)
+2. ALWAYS leave a blank line after each ## header
+3. ALWAYS leave a blank line before each ## header
+4. Use *italics* for class names, variable names, method names (e.g., *UserService*, *nameOrEmailChanged*)
+5. Use `backticks` for file names (e.g., `UserService.java`)
+6. Use **bold** for warnings and critical terms (e.g., **Breaking Change**, **HIGH RISK**)
+7. ALWAYS show code changes in fenced code blocks with language specified:
+
+```java
+// Example code block
+boolean nameOrEmailChanged = !user.getEmail().equals(userDTO.getEmail());
+if (nameOrEmailChanged) {
+    auth0Service.updateNames();
+}
+```
+
+8. Put each bullet point on its own line
+9. Leave blank lines between different types of content (text, code blocks, lists)"""
 
 CHAT_WITH_PR_CONTEXT_PROMPT = """You are a Senior Software Engineer assistant helping with GitHub PR reviews. You have context about a specific PR and should answer questions about it.
 
@@ -111,22 +146,152 @@ When discussing PRs:
 
 IMPORTANT: Always respond in plain text with markdown formatting. Do NOT return JSON. Use headers, bullet points, and code blocks for clarity.
 
-Structure your response like this:
+Structure your response EXACTLY like this format (with blank lines between sections):
+
 ## Summary
-Brief overview of the PR
+
+Brief overview of the PR in 2-3 sentences.
 
 ## Key Changes
-- List important changes
+
+- First key change with *className* or *variableName* in italics
+- Second key change
+
+**Code Added/Modified:**
+
+```java
+// Show the actual code that was changed
+boolean nameOrEmailChanged = !user.getEmail().equals(userDTO.getEmail());
+```
 
 ## Risk Assessment
+
 **Risk Level:** Low/Medium/High/Critical
-- Specific risks identified
+
+- First risk detail
+- Second risk detail
 
 ## Suggestions
-- Actionable improvements
 
-## Breaking Changes (if any)
-- List potential breaking changes"""
+- First suggestion
+- Second suggestion
+
+## Breaking Changes
+
+- List breaking changes or "None identified"
+
+CRITICAL FORMATTING RULES:
+1. ALWAYS use ## for section headers (## Summary, ## Key Changes, etc.)
+2. ALWAYS leave a blank line after each ## header
+3. ALWAYS leave a blank line before each ## header
+4. Use *italics* for class names, variable names, method names (e.g., *UserService*, *nameOrEmailChanged*)
+5. Use `backticks` for file names (e.g., `UserService.java`)
+6. Use **bold** for warnings and critical terms (e.g., **Breaking Change**, **HIGH RISK**)
+7. ALWAYS show code changes in fenced code blocks with language specified:
+
+```java
+// Example code block
+boolean nameOrEmailChanged = !user.getEmail().equals(userDTO.getEmail());
+if (nameOrEmailChanged) {
+    auth0Service.updateNames();
+}
+```
+
+8. Put each bullet point on its own line
+9. Leave blank lines between different types of content (text, code blocks, lists)
+
+Risk Level Guidelines for reference:
+- Low: Minor changes, documentation, small bug fixes, no breaking changes
+- Medium: New features, refactoring, changes to non-critical paths
+- High: Changes to core functionality, database migrations, API changes, security-related code
+- Critical: Breaking changes, security vulnerabilities, data migration risks"""
+
+GENERAL_QUERY_SYSTEM_PROMPT = """You are tasked with providing a comprehensive, detailed, and nuanced final answer to the given user query. Provide a detailed response and cover all aspects of the query.
+
+The final answer must be at least 800 words long and should be structured with an introduction, detailed analysis of the topic from multiple perspectives, and a concluding summary.
+
+ABSOLUTE FORMATTING RULES - NEVER BREAK THESE:
+
+FORBIDDEN - NEVER USE:
+- Bullet points (-)
+- Numbered lists (1. 2. 3.)
+- Asterisks as list markers (*)
+
+REQUIRED FORMAT:
+- Use ## for main section headers
+- Use ### for subsection headers
+- Write ONLY in flowing paragraphs
+- Use **bold** for key terms WITHIN paragraphs
+
+EXAMPLE OF CORRECT FORMAT:
+
+## Introduction
+
+Money is a standardized medium of exchange used to facilitate transactions between parties. It functions as a unit of account, a store of value, and a standard of deferred payment.
+
+## Key Characteristics of Money
+
+### Medium of Exchange
+
+Money is universally accepted in exchange for goods and services, eliminating the inefficiencies of a barter system. In a barter economy, two parties must each have what the other wants, which is known as the **double coincidence of wants**. Money solves this problem by serving as an intermediary.
+
+### Unit of Account
+
+Money provides a standard measurement of value in the economy, making it easier to compare the prices of goods and services. Without a unit of account, every good would need to be priced in terms of every other good.
+
+### Store of Value
+
+Money can store economic value over time, allowing individuals to save and delay consumption until the future. This function depends on money maintaining its **purchasing power** over time.
+
+## Forms of Money
+
+### Commodity Money
+
+**Commodity money** involves physical items that hold intrinsic value, such as gold or silver. Historically, these commodities were used as a means of exchange before the evolution of modern monetary systems.
+
+### Fiat Money
+
+**Fiat money** refers to currency without intrinsic value, issued by a government and accepted by its people as a medium of exchange. The value of fiat money derives from trust in the authority of the issuing entity. Examples include the US dollar and euro.
+
+### Digital Money
+
+**Digital money** consists of non-physical forms of money, such as balances held electronically or cryptocurrency. Digital money, exemplified by electronic banking and cryptocurrencies like Bitcoin, uses digital networks for secure transactions.
+
+## Conclusion
+
+In summary, money serves as the foundation of modern economic systems by facilitating trade and enabling economic growth.
+
+END EXAMPLE
+
+Remember: NO BULLET POINTS, NO NUMBERED LISTS. Only headers (## and ###) and paragraphs with inline **bold** text."""
+
+
+
+
+def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
+    """Determine if the query is related to GitHub PR/code review."""
+    message_lower = message.lower()
+
+    # Check for PR URL in the message
+    if re.search(PR_URL_PATTERN, message):
+        return True
+
+    # Check for PR-related keywords
+    for keyword in PR_RELATED_KEYWORDS:
+        if keyword in message_lower:
+            return True
+
+    # Check conversation history for PR context
+    if chat_history:
+        for msg in chat_history[-5:]:  # Check last 5 messages
+            content = msg.get("content", "").lower()
+            if re.search(PR_URL_PATTERN, content):
+                return True
+            # If recent conversation mentions PR-specific terms
+            if any(kw in content for kw in ['pull request', 'github.com/pull', 'pr #', 'this pr']):
+                return True
+
+    return False
 
 
 async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
@@ -321,7 +486,7 @@ async def analyze_pr_with_ai(pr_context: str, user_query: str, is_structured: bo
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_query}"}
         ],
-        max_tokens=200,
+        max_tokens=2000,
         temperature=0.3
     )
     return response.choices[0].message.content
@@ -423,12 +588,22 @@ async def send_message(message_data: MessageCreate):
         is_structured = query_type in ['summarize', 'review', 'risk_analysis']
         ai_response = await analyze_pr_with_ai(pr_context, user_message, is_structured)
     else:
-        messages = [{"role": "system", "content": CHAT_WITH_PR_CONTEXT_PROMPT}]
+        # Check if query is PR-related or general
+        is_pr_query = is_pr_related_query(user_message, history.data)
+
+        if is_pr_query:
+            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
+            max_tokens = 2000
+        else:
+            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
+            max_tokens = 4000
+
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
 
         try:
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini", messages=messages, max_tokens=200
+                model="gpt-4o", messages=messages, max_tokens=max_tokens
             )
             ai_response = response.choices[0].message.content
         except Exception as e:
@@ -535,14 +710,26 @@ async def send_message_stream(message_data: MessageCreate):
 
     history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
 
+    # Determine system prompt and max tokens based on query type
     if pr_context:
         system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_message}"}
         ]
+        max_tokens = 2000
     else:
-        messages = [{"role": "system", "content": CHAT_WITH_PR_CONTEXT_PROMPT}]
+        # Check if query is PR-related or general
+        is_pr_query = is_pr_related_query(user_message, history.data)
+
+        if is_pr_query:
+            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
+            max_tokens = 2000
+        else:
+            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
+            max_tokens = 4000
+
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
 
     async def generate():
@@ -576,7 +763,7 @@ async def send_message_stream(message_data: MessageCreate):
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
 
             stream = openai_client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=200, stream=True
+                model="gpt-4o", messages=messages, max_tokens=max_tokens, stream=True
             )
             for chunk in stream:
                 if chunk.choices[0].delta.content:
