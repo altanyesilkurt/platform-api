@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -48,25 +48,13 @@ class ChatUpdate(BaseModel):
 class MessageCreate(BaseModel):
     chat_id: str
     message: str = Field(..., min_length=1)
-
-
-class PRAnalysisResponse(BaseModel):
-    summary: str
-    risk_level: str
-    risk_details: List[str]
-    key_changes: List[str]
-    suggestions: List[str]
-    breaking_changes: List[str]
-    files_affected: int
-    lines_added: int
-    lines_deleted: int
+    analyze_merged: bool = Field(default=True, description="Whether to analyze merged/closed PRs")
 
 
 # GitHub URL patterns
 PR_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)'
 COMMIT_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+)'
 
-# Keywords that indicate PR/code review/commit related queries
 PR_RELATED_KEYWORDS = [
     'pull request', 'pr', 'code review', 'github', 'merge', 'commit', 'branch',
     'diff', 'repository', 'repo', 'git', 'review this', 'analyze this pr',
@@ -74,54 +62,70 @@ PR_RELATED_KEYWORDS = [
     'file changes', 'breaking changes', 'risk assessment', 'code analysis',
     '/pull/', '/commit/', 'github.com', 'approve', 'request changes', 'mergeable',
     'conflicts', 'base branch', 'head branch', 'squash', 'rebase',
-    'analyze commit', 'review commit', 'commit changes', 'sha'
+    'analyze commit', 'review commit', 'commit changes', 'sha',
+    'merged pr', 'what was merged', 'merge history', 'merged changes'
 ]
+
+# Updated system prompt to handle merged PRs
+MERGED_PR_ANALYSIS_PROMPT = """You are a Senior Software Engineer reviewing a MERGED Pull Request. 
+This PR has already been merged into the codebase. Your analysis should focus on:
+
+1. **Understanding what was merged** - Summarize the changes that are now in the codebase
+2. **Post-merge review** - Identify any concerns that might need follow-up issues
+3. **Documentation** - Help understand the historical context of these changes
+4. **Learning** - Extract lessons or patterns from this merged code
+
+Since this PR is already merged, focus on documentation and understanding rather than approval/rejection.
+
+FORMATTING RULES:
+- Use ## for section headers
+- Use *italics* for class/variable names
+- Use `backticks` for file names
+- Use **bold** for important terms
+- Show code in fenced blocks with language specified
+- Leave blank lines between sections"""
 
 
 def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
     """Determine if the query is related to GitHub PR/code review/commit."""
     message_lower = message.lower()
-
-    # Check for PR URL in the message
-    if re.search(PR_URL_PATTERN, message):
+    if re.search(PR_URL_PATTERN, message) or re.search(COMMIT_URL_PATTERN, message):
         return True
-
-    # Check for Commit URL in the message
-    if re.search(COMMIT_URL_PATTERN, message):
-        return True
-
-    # Check for PR-related keywords
     for keyword in PR_RELATED_KEYWORDS:
         if keyword in message_lower:
             return True
-
-    # Check conversation history for PR/commit context
     if chat_history:
-        for msg in chat_history[-5:]:  # Check last 5 messages
+        for msg in chat_history[-5:]:
             content = msg.get("content", "").lower()
-            if re.search(PR_URL_PATTERN, content):
+            if re.search(PR_URL_PATTERN, content) or re.search(COMMIT_URL_PATTERN, content):
                 return True
-            if re.search(COMMIT_URL_PATTERN, content):
+            if any(kw in content for kw in ['pull request', 'github.com/pull', 'pr #', 'this pr', 'this commit']):
                 return True
-            # If recent conversation mentions PR/commit-specific terms
-            if any(kw in content for kw in
-                   ['pull request', 'github.com/pull', 'pr #', 'this pr', 'this commit', 'commit sha']):
-                return True
-
     return False
 
 
+def extract_pr_url(message: str) -> Optional[tuple]:
+    match = re.search(PR_URL_PATTERN, message)
+    if match:
+        return (match.group(1), match.group(2), int(match.group(3)))
+    return None
+
+
+def extract_commit_url(message: str) -> Optional[tuple]:
+    match = re.search(COMMIT_URL_PATTERN, message)
+    if match:
+        return (match.group(1), match.group(2), match.group(3))
+    return None
+
+
 async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+    """Fetch PR details including merge information."""
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "PR-Assistant"
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    else:
-        print("WARNING: No GITHUB_TOKEN set. API rate limits will be very restrictive.")
-
-    print(f"Fetching PR: {owner}/{repo}#{pr_number}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -146,11 +150,6 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
 
             pr_data = pr_response.json()
 
-            if not pr_data:
-                raise HTTPException(status_code=500, detail="GitHub returned empty PR data")
-
-            print(f"PR Title: {pr_data.get('title', 'N/A')}, State: {pr_data.get('state', 'N/A')}")
-
             diff_content = ""
             try:
                 diff_headers = {**headers, "Accept": "application/vnd.github.v3.diff"}
@@ -160,35 +159,49 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
             except Exception as e:
                 print(f"Warning: Failed to fetch diff: {e}")
 
-            # Fetch PR files
             files_data = []
             try:
-                files_url = f"{pr_url}/files"
-                files_response = await client.get(files_url, headers=headers)
+                files_response = await client.get(f"{pr_url}/files", headers=headers)
                 if files_response.status_code == 200:
                     files_data = files_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch files: {e}")
+            except Exception:
+                pass
 
-            # Fetch PR commits
+            # Fetch commits
             commits_data = []
             try:
-                commits_url = f"{pr_url}/commits"
-                commits_response = await client.get(commits_url, headers=headers)
+                commits_response = await client.get(f"{pr_url}/commits", headers=headers)
                 if commits_response.status_code == 200:
                     commits_data = commits_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch commits: {e}")
+            except Exception:
+                pass
 
-            # Fetch PR comments
+            # Fetch comments
             comments_data = []
             try:
-                comments_url = f"{pr_url}/comments"
-                comments_response = await client.get(comments_url, headers=headers)
+                comments_response = await client.get(f"{pr_url}/comments", headers=headers)
                 if comments_response.status_code == 200:
                     comments_data = comments_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch comments: {e}")
+            except Exception:
+                pass
+
+            # Fetch review comments (inline code comments)
+            review_comments = []
+            try:
+                review_comments_response = await client.get(f"{pr_url}/comments", headers=headers)
+                if review_comments_response.status_code == 200:
+                    review_comments = review_comments_response.json() or []
+            except Exception:
+                pass
+
+            # Fetch reviews (approvals, change requests)
+            reviews = []
+            try:
+                reviews_response = await client.get(f"{pr_url}/reviews", headers=headers)
+                if reviews_response.status_code == 200:
+                    reviews = reviews_response.json() or []
+            except Exception:
+                pass
 
             return {
                 "pr": pr_data,
@@ -196,39 +209,16 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
                 "files": files_data[:100] if files_data else [],
                 "commits": commits_data[:50] if commits_data else [],
                 "comments": comments_data[:50] if comments_data else [],
+                "review_comments": review_comments[:50] if review_comments else [],
+                "reviews": reviews[:20] if reviews else [],
                 "url": f"https://github.com/{owner}/{repo}/pull/{pr_number}"
             }
     except HTTPException:
         raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504,
-                            detail=f"Request to GitHub timed out. The repository {owner}/{repo} may be slow to respond.")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Network error connecting to GitHub: {str(e)}")
+        raise HTTPException(status_code=504, detail="Request to GitHub timed out")
     except Exception as e:
-        print(f"Unexpected error in fetch_github_pr: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error fetching PR: {type(e).__name__}: {str(e)}")
-
-
-def extract_pr_url(message: str) -> Optional[tuple]:
-    """Extract GitHub PR URL from message."""
-    match = re.search(PR_URL_PATTERN, message)
-    if match:
-        result = (match.group(1), match.group(2), int(match.group(3)))
-        print(f"Extracted PR URL: owner={result[0]}, repo={result[1]}, pr={result[2]}")
-        return result
-    print(f"No PR URL found in message: {message[:100]}...")
-    return None
-
-
-def extract_commit_url(message: str) -> Optional[tuple]:
-    """Extract GitHub Commit URL from message."""
-    match = re.search(COMMIT_URL_PATTERN, message)
-    if match:
-        result = (match.group(1), match.group(2), match.group(3))
-        print(f"Extracted Commit URL: owner={result[0]}, repo={result[1]}, sha={result[2]}")
-        return result
-    return None
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
 async def fetch_github_commit(owner: str, repo: str, commit_sha: str) -> Dict[str, Any]:
@@ -239,114 +229,71 @@ async def fetch_github_commit(owner: str, repo: str, commit_sha: str) -> Dict[st
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    else:
-        print("WARNING: No GITHUB_TOKEN set. API rate limits will be very restrictive.")
-
-    print(f"Fetching Commit: {owner}/{repo}@{commit_sha[:7]}")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             commit_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{commit_sha}"
-            commit_response = await client.get(commit_url, headers=headers)
+            response = await client.get(commit_url, headers=headers)
 
-            print(f"GitHub Commit response status: {commit_response.status_code}")
-
-            if commit_response.status_code == 404:
-                raise HTTPException(status_code=404,
-                                    detail=f"Commit {commit_sha[:7]} not found in {owner}/{repo}.")
-            elif commit_response.status_code == 403:
-                error_data = commit_response.json() if commit_response.text else {}
-                if "rate limit" in error_data.get("message", "").lower():
-                    raise HTTPException(status_code=403,
-                                        detail="GitHub API rate limit exceeded.")
-                raise HTTPException(status_code=403,
-                                    detail=f"Access denied to {owner}/{repo}.")
-            elif commit_response.status_code != 200:
-                raise HTTPException(status_code=commit_response.status_code,
-                                    detail=f"GitHub API error: {commit_response.text[:200]}")
-
-            commit_data = commit_response.json()
-
-            if not commit_data:
-                raise HTTPException(status_code=500, detail="GitHub returned empty commit data")
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Commit {commit_sha[:7]} not found")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="GitHub API error")
 
             return {
-                "commit": commit_data,
+                "commit": response.json(),
                 "url": f"https://github.com/{owner}/{repo}/commit/{commit_sha}"
             }
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504,
-                            detail=f"Request to GitHub timed out.")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Network error connecting to GitHub: {str(e)}")
     except Exception as e:
-        print(f"Unexpected error in fetch_github_commit: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
-def format_commit_context(commit_data: Dict[str, Any]) -> str:
-    """Format commit data for AI context."""
-    commit = commit_data.get("commit", {})
-    commit_info = commit.get("commit", {})
-    author = commit_info.get("author", {})
-    committer = commit_info.get("committer", {})
-    stats = commit.get("stats", {})
-    files = commit.get("files", [])
+def format_pr_context(pr_data: Dict[str, Any], include_merge_info: bool = True) -> str:
+    """Format PR data for AI context, including merge information."""
+    pr = pr_data.get("pr", {})
+    files = pr_data.get("files", [])
+    diff = pr_data.get("diff", "")
+    commits = pr_data.get("commits", [])
+    reviews = pr_data.get("reviews", [])
+
+    user = pr.get("user", {}) or {}
+    base = pr.get("base", {}) or {}
+    head = pr.get("head", {}) or {}
+
+    # Merge information
+    merge_info = ""
+    if pr.get("merged"):
+        merged_by = (pr.get("merged_by") or {}).get("login", "Unknown")
+        merge_info = f"""
+### Merge Information:
+- **Status:** ✅ MERGED
+- **Merged By:** {merged_by}
+- **Merged At:** {pr.get('merged_at', 'N/A')}
+- **Merge Commit SHA:** {pr.get('merge_commit_sha', 'N/A')[:7] if pr.get('merge_commit_sha') else 'N/A'}
+"""
+    elif pr.get("state") == "closed":
+        merge_info = "\n### Status: ❌ CLOSED (Not Merged)\n"
 
     files_summary = "\n".join([
         f"- `{f.get('filename', 'unknown')}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)}) [{f.get('status', 'unknown')}]"
         for f in (files or [])[:30]
     ]) or "No files information available"
 
-    # Build patches summary
-    patches_summary = ""
-    for f in (files or [])[:10]:
-        patch = f.get("patch", "")
-        if patch:
-            patches_summary += f"\n### `{f.get('filename', 'unknown')}`\n```diff\n{patch[:3000]}\n```\n"
+    # Commits summary
+    commits_summary = "\n".join([
+        f"- `{c.get('sha', '')[:7]}` - {c.get('commit', {}).get('message', '').split(chr(10))[0][:80]}"
+        for c in (commits or [])[:15]
+    ]) or "No commits information"
 
-    return f"""
-## Commit: {commit_info.get('message', 'No message')[:200]}
-
-**URL:** {commit_data.get('url', 'N/A')}
-**SHA:** {commit.get('sha', 'unknown')}
-**Author:** {author.get('name', 'Unknown')} <{author.get('email', '')}>
-**Date:** {author.get('date', 'N/A')}
-**Committer:** {committer.get('name', 'Unknown')}
-
-### Full Commit Message:
-{commit_info.get('message', 'No message provided')}
-
-### Statistics:
-- Files Changed: {len(files) if files else 0}
-- Additions: {stats.get('additions', 0)}
-- Deletions: {stats.get('deletions', 0)}
-- Total Changes: {stats.get('total', 0)}
-
-### Files Changed:
-{files_summary}
-
-### Code Changes:
-{patches_summary if patches_summary else 'No patch data available'}
-"""
-
-def format_pr_context(pr_data: Dict[str, Any]) -> str:
-    """Format PR data for AI context."""
-    pr = pr_data.get("pr", {})
-    files = pr_data.get("files", [])
-    diff = pr_data.get("diff", "")
-
-    # Safely get nested values
-    user = pr.get("user", {}) or {}
-    base = pr.get("base", {}) or {}
-    head = pr.get("head", {}) or {}
-
-    files_summary = "\n".join([
-        f"- {f.get('filename', 'unknown')} (+{f.get('additions', 0)}/-{f.get('deletions', 0)}) [{f.get('status', 'unknown')}]"
-        for f in (files or [])[:30]
-    ]) or "No files information available"
+    # Reviews summary
+    reviews_summary = ""
+    if reviews:
+        reviews_summary = "\n### Reviews:\n" + "\n".join([
+            f"- **{r.get('user', {}).get('login', 'Unknown')}**: {r.get('state', 'UNKNOWN')}"
+            for r in reviews[:10]
+        ])
 
     return f"""
 ## Pull Request: {pr.get('title', 'Unknown Title')}
@@ -356,7 +303,7 @@ def format_pr_context(pr_data: Dict[str, Any]) -> str:
 **Base Branch:** {base.get('ref', 'unknown')} ← **Head Branch:** {head.get('ref', 'unknown')}
 **Created:** {pr.get('created_at', 'N/A')}
 **Updated:** {pr.get('updated_at', 'N/A')}
-
+{merge_info if include_merge_info else ''}
 ### Description:
 {(pr.get('body') or 'No description provided')[:2000]}
 
@@ -364,11 +311,14 @@ def format_pr_context(pr_data: Dict[str, Any]) -> str:
 - Files Changed: {len(files) if files else 0}
 - Additions: {pr.get('additions', 0)}
 - Deletions: {pr.get('deletions', 0)}
-- Commits: {pr.get('commits', 0)}
+- Total Commits: {pr.get('commits', 0)}
+
+### Commits:
+{commits_summary}
 
 ### Files Changed:
 {files_summary}
-
+{reviews_summary}
 ### Code Diff (truncated):
 ```diff
 {diff[:30000] if diff else 'No diff available'}
@@ -376,22 +326,55 @@ def format_pr_context(pr_data: Dict[str, Any]) -> str:
 """
 
 
+def format_commit_context(commit_data: Dict[str, Any]) -> str:
+    """Format commit data for AI context."""
+    commit = commit_data.get("commit", {})
+    commit_info = commit.get("commit", {})
+    author = commit_info.get("author", {})
+    stats = commit.get("stats", {})
+    files = commit.get("files", [])
+
+    files_summary = "\n".join([
+        f"- `{f.get('filename', 'unknown')}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)})"
+        for f in (files or [])[:30]
+    ]) or "No files information"
+
+    patches = ""
+    for f in (files or [])[:10]:
+        if f.get("patch"):
+            patches += f"\n### `{f.get('filename')}`\n```diff\n{f['patch'][:3000]}\n```\n"
+
+    return f"""
+## Commit: {commit_info.get('message', 'No message')[:200]}
+**URL:** {commit_data.get('url', 'N/A')}
+**SHA:** {commit.get('sha', 'unknown')}
+**Author:** {author.get('name', 'Unknown')}
+**Date:** {author.get('date', 'N/A')}
+
+### Statistics:
+- Files: {len(files) if files else 0}
+- Additions: {stats.get('additions', 0)}
+- Deletions: {stats.get('deletions', 0)}
+
+### Files:
+{files_summary}
+
+### Changes:
+{patches if patches else 'No patch data'}
+"""
+
+
 def generate_chat_title(user_message: str, ai_response: str) -> str:
-    """Generate a short title for the chat."""
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system",
-                 "content": "Generate a short title (3-6 words max) for this conversation. Return ONLY the title, no quotes."},
-                {"role": "user",
-                 "content": f"User asked: {user_message[:200]}\n\nAssistant replied: {ai_response[:300]}"}
+                {"role": "system", "content": "Generate a short title (3-6 words). Return ONLY the title."},
+                {"role": "user", "content": f"User: {user_message[:200]}\nAssistant: {ai_response[:300]}"}
             ],
-            max_tokens=20,
-            temperature=0.7
+            max_tokens=20
         )
-        title = response.choices[0].message.content.strip().strip('"\'')
-        return title[:50] if len(title) > 50 else title
+        return response.choices[0].message.content.strip().strip('"\'')[:50]
     except:
         return "PR Review Chat"
 
@@ -401,37 +384,8 @@ def is_first_exchange(chat_id: str) -> bool:
     return response.count <= 1
 
 
-async def analyze_pr_with_ai(pr_context: str, user_query: str, is_structured: bool = True) -> str:
-    """Analyze PR using OpenAI."""
-    system_prompt = PR_ANALYSIS_SYSTEM_PROMPT if is_structured else CHAT_WITH_PR_CONTEXT_PROMPT
+# ============ ENDPOINTS ============
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_query}"}
-        ],
-        max_tokens=2000,
-        temperature=0.3
-    )
-    return response.choices[0].message.content
-
-
-def detect_query_type(message: str) -> str:
-    """Detect the type of PR-related query."""
-    message_lower = message.lower()
-    if any(word in message_lower for word in ['summarize', 'summary', 'what changed', 'overview']):
-        return 'summarize'
-    elif any(word in message_lower for word in ['review', 'code review', 'feedback']):
-        return 'review'
-    elif any(word in message_lower for word in ['risk', 'risky', 'dangerous', 'breaking', 'break']):
-        return 'risk_analysis'
-    elif any(word in message_lower for word in ['suggest', 'improve', 'issues', 'follow-up']):
-        return 'suggestions'
-    return 'general'
-
-
-# Existing endpoints
 @app.get("/chats")
 async def get_chats():
     response = supabase.table("chats").select("*").order("updated_at", desc=True).execute()
@@ -471,103 +425,18 @@ async def get_messages(chat_id: str):
     return response.data
 
 
-# Enhanced chat endpoint with PR intelligence
-@app.post("/chat")
-async def send_message(message_data: MessageCreate):
-    user_message = message_data.message
-    chat_id = message_data.chat_id
-    first_exchange = is_first_exchange(chat_id)
-
-    # Save user message
-    supabase.table("messages").insert({
-        "chat_id": chat_id, "role": "user", "content": user_message
-    }).execute()
-
-    # Check for PR URL
-    pr_info = extract_pr_url(user_message)
-    pr_context = None
-    pr_metadata = None
-    pr_fetch_error = None
-
-    if pr_info:
-        owner, repo, pr_number = pr_info
-        try:
-            pr_data = await fetch_github_pr(owner, repo, pr_number)
-            pr_context = format_pr_context(pr_data)
-            pr_metadata = {
-                "pr_url": pr_data["url"],
-                "pr_title": pr_data["pr"]["title"],
-                "files_changed": len(pr_data["files"]),
-                "additions": pr_data["pr"]["additions"],
-                "deletions": pr_data["pr"]["deletions"]
-            }
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"GitHub API error: {str(e)}")
-
-    # Get conversation history
-    history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
-
-    # Build messages
-    if pr_context:
-        query_type = detect_query_type(user_message)
-        is_structured = query_type in ['summarize', 'review', 'risk_analysis']
-        ai_response = await analyze_pr_with_ai(pr_context, user_message, is_structured)
-    else:
-        # Check if query is PR-related or general
-        is_pr_query = is_pr_related_query(user_message, history.data)
-
-        if is_pr_query:
-            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
-            max_tokens = 2000
-        else:
-            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
-            max_tokens = 4000
-
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
-
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=max_tokens
-            )
-            ai_response = response.choices[0].message.content
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"AI error: {str(e)}")
-
-    # Save assistant response
-    assistant_msg = supabase.table("messages").insert({
-        "chat_id": chat_id, "role": "assistant", "content": ai_response
-    }).execute()
-
-    # Generate title if first exchange
-    new_title = None
-    if first_exchange:
-        new_title = generate_chat_title(user_message, ai_response)
-        supabase.table("chats").update({"title": new_title}).eq("id", chat_id).execute()
-
-    return {
-        "id": assistant_msg.data[0]["id"],
-        "role": "assistant",
-        "content": ai_response,
-        "new_title": new_title,
-        "pr_metadata": pr_metadata
-    }
-
-
-# Streaming endpoint with PR intelligence
 @app.post("/chat/stream")
 async def send_message_stream(message_data: MessageCreate):
     user_message = message_data.message
     chat_id = message_data.chat_id
+    analyze_merged = message_data.analyze_merged
     first_exchange = is_first_exchange(chat_id)
 
     supabase.table("messages").insert({
         "chat_id": chat_id, "role": "user", "content": user_message
     }).execute()
 
-    # Check for PR URL
     pr_info = extract_pr_url(user_message)
-    # Check for Commit URL
     commit_info = extract_commit_url(user_message)
 
     pr_context = None
@@ -581,61 +450,73 @@ async def send_message_stream(message_data: MessageCreate):
         owner, repo, pr_number = pr_info
         try:
             pr_data = await fetch_github_pr(owner, repo, pr_number)
-            pr_context = format_pr_context(pr_data)
             pr = pr_data.get("pr", {})
             pr_state = pr.get("state", "unknown")
             pr_merged = pr.get("merged", False)
 
+            # Always format context (including for merged PRs)
+            pr_context = format_pr_context(pr_data, include_merge_info=True)
+
             # Extract commits
-            commits = []
-            for c in pr_data.get("commits", [])[:10]:
-                c_info = c.get("commit", {})
-                commits.append({
-                    "sha": c.get("sha", "")[:7],
-                    "message": c_info.get("message", "").split("\n")[0][:100],
-                    "author": c_info.get("author", {}).get("name", "Unknown")
-                })
+            commits = [{
+                "sha": c.get("sha", "")[:7],
+                "sha_full": c.get("sha", ""),
+                "message": c.get("commit", {}).get("message", "").split("\n")[0][:100],
+                "author": c.get("commit", {}).get("author", {}).get("name", "Unknown"),
+                "date": c.get("commit", {}).get("author", {}).get("date", "")
+            } for c in pr_data.get("commits", [])[:20]]
 
             # Extract files with patches
-            files = []
-            for f in pr_data.get("files", [])[:20]:
-                files.append({
-                    "filename": f.get("filename", ""),
-                    "status": f.get("status", ""),
-                    "additions": f.get("additions", 0),
-                    "deletions": f.get("deletions", 0),
-                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
-                })
+            files = [{
+                "filename": f.get("filename", ""),
+                "status": f.get("status", ""),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
+            } for f in pr_data.get("files", [])[:30]]
+
+            # Extract reviews
+            reviews = [{
+                "user": r.get("user", {}).get("login", "Unknown"),
+                "state": r.get("state", ""),
+                "body": r.get("body", "")[:500] if r.get("body") else "",
+                "submitted_at": r.get("submitted_at", "")
+            } for r in pr_data.get("reviews", [])[:10]]
 
             pr_metadata = {
-                "pr_url": pr_data.get("url", f"https://github.com/{owner}/{repo}/pull/{pr_number}"),
+                "pr_url": pr_data.get("url"),
                 "pr_title": pr.get("title", "Unknown PR"),
-                "pr_body": (pr.get("body") or "No description provided")[:500],
+                "pr_body": (pr.get("body") or "")[:500],
                 "pr_state": pr_state,
                 "pr_merged": pr_merged,
                 "pr_author": (pr.get("user") or {}).get("login", "Unknown"),
+                "base_branch": (pr.get("base") or {}).get("ref", "unknown"),
+                "head_branch": (pr.get("head") or {}).get("ref", "unknown"),
                 "files_changed": len(pr_data.get("files", [])),
                 "additions": pr.get("additions", 0),
                 "deletions": pr.get("deletions", 0),
+                "commits_count": pr.get("commits", 0),
                 "commits": commits,
-                "files": files
+                "files": files,
+                "reviews": reviews,
+                "created_at": pr.get("created_at", ""),
+                "updated_at": pr.get("updated_at", ""),
+                # Merge-specific fields
+                "merged_at": pr.get("merged_at") if pr_merged else None,
+                "merged_by": (pr.get("merged_by") or {}).get("login") if pr_merged else None,
+                "merge_commit_sha": pr.get("merge_commit_sha") if pr_merged else None,
             }
 
-            if pr_state == "closed" or pr_merged:
-                merged_by = (pr.get("merged_by") or {}).get("login", "")
-                if pr_merged:
-                    status_message = f"This PR has already been merged{' by ' + merged_by if merged_by else ''}. No analysis needed."
-                else:
-                    status_message = "This PR has been closed without merging. No analysis needed."
-                pr_metadata["status_message"] = status_message
+            # Only skip analysis if explicitly requested AND PR is merged/closed
+            if not analyze_merged and (pr_state == "closed" or pr_merged):
+                status = "merged" if pr_merged else "closed"
+                pr_metadata["skip_analysis"] = True
+                pr_metadata["status_message"] = f"This PR has been {status}. Analysis skipped (analyze_merged=false)."
                 pr_context = None
 
-            print(f"Successfully fetched PR: {pr_metadata['pr_title']} (state: {pr_state}, merged: {pr_merged})")
         except HTTPException as e:
-            print(f"HTTP ERROR fetching PR: {e.detail}")
             fetch_error = e.detail
         except Exception as e:
-            print(f"ERROR fetching PR: {str(e)}")
             fetch_error = str(e)
 
     # Handle Commit URL
@@ -650,70 +531,52 @@ async def send_message_stream(message_data: MessageCreate):
             stats = commit.get("stats", {})
             files = commit.get("files", [])
 
-            # Extract files with patches for metadata
-            files_list = []
-            for f in (files or [])[:20]:
-                files_list.append({
-                    "filename": f.get("filename", ""),
-                    "status": f.get("status", ""),
-                    "additions": f.get("additions", 0),
-                    "deletions": f.get("deletions", 0),
-                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
-                })
-
             commit_metadata = {
                 "type": "commit",
                 "commit_url": commit_data.get("url"),
                 "commit_sha": commit.get("sha", "")[:7],
                 "commit_sha_full": commit.get("sha", ""),
-                "commit_message": commit_info_data.get("message", ""),  # Full message including description
+                "commit_message": commit_info_data.get("message", ""),
                 "commit_author": author.get("name", "Unknown"),
-                "commit_author_email": author.get("email", ""),
                 "commit_date": author.get("date", ""),
                 "files_changed": len(files) if files else 0,
                 "additions": stats.get("additions", 0),
                 "deletions": stats.get("deletions", 0),
-                "total_changes": stats.get("total", 0),
-                "files": files_list
+                "files": [{
+                    "filename": f.get("filename", ""),
+                    "status": f.get("status", ""),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
+                } for f in (files or [])[:20]]
             }
-
-            print(f"Successfully fetched Commit: {commit_metadata['commit_sha']} - {commit_metadata['commit_message']}")
         except HTTPException as e:
-            print(f"HTTP ERROR fetching Commit: {e.detail}")
             fetch_error = e.detail
         except Exception as e:
-            print(f"ERROR fetching Commit: {str(e)}")
             fetch_error = str(e)
 
     history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
 
-    # Determine system prompt and max tokens based on query type
+    # Determine system prompt based on context
     if pr_context:
-        system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
+        # Use merged PR prompt if PR is merged
+        is_merged = pr_metadata and pr_metadata.get("pr_merged")
+        system_prompt = MERGED_PR_ANALYSIS_PROMPT if is_merged else CHAT_WITH_PR_CONTEXT_PROMPT
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_message}"}
         ]
-        max_tokens = 2000
+        max_tokens = 2500
     elif commit_context:
-        system_prompt = COMMIT_ANALYSIS_SYSTEM_PROMPT
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",
-             "content": f"{commit_context}\n\n---\n\nUser Request: Analyze this commit and provide insights."}
+            {"role": "system", "content": COMMIT_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{commit_context}\n\n---\n\nAnalyze this commit."}
         ]
         max_tokens = 2000
     else:
-        # Check if query is PR-related or general
         is_pr_query = is_pr_related_query(user_message, history.data)
-
-        if is_pr_query:
-            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
-            max_tokens = 2000
-        else:
-            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
-            max_tokens = 4000
-
+        system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT if is_pr_query else GENERAL_QUERY_SYSTEM_PROMPT
+        max_tokens = 2000 if is_pr_query else 4000
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
 
@@ -722,33 +585,32 @@ async def send_message_stream(message_data: MessageCreate):
         try:
             # Handle fetch error
             if (pr_info or commit_info) and fetch_error:
-                error_msg = f"Unable to fetch from GitHub. {fetch_error}"
+                error_msg = f"Unable to fetch from GitHub: {fetch_error}"
                 yield f"data: {json.dumps({'content': error_msg})}\n\n"
-
                 result = supabase.table("messages").insert({
                     "chat_id": chat_id, "role": "assistant", "content": error_msg
                 }).execute()
-                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id']})}\n\n"
                 return
 
-            # Handle closed/merged PR
-            if pr_metadata and pr_metadata.get("status_message"):
-                status_msg = pr_metadata["status_message"]
+            # Handle skipped analysis (only when analyze_merged=false)
+            if pr_metadata and pr_metadata.get("skip_analysis"):
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
-                yield f"data: {json.dumps({'content': status_msg})}\n\n"
-
+                msg = pr_metadata["status_message"]
+                yield f"data: {json.dumps({'content': msg})}\n\n"
                 result = supabase.table("messages").insert({
-                    "chat_id": chat_id, "role": "assistant", "content": status_msg
+                    "chat_id": chat_id, "role": "assistant", "content": msg
                 }).execute()
-                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id']})}\n\n"
                 return
 
-            # Send metadata first if available
+            # Send metadata first
             if pr_metadata:
                 yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
             elif commit_metadata:
                 yield f"data: {json.dumps({'commit_metadata': commit_metadata})}\n\n"
 
+            # Stream AI response
             stream = openai_client.chat.completions.create(
                 model="gpt-4o", messages=messages, max_tokens=max_tokens, stream=True
             )
@@ -777,202 +639,145 @@ async def send_message_stream(message_data: MessageCreate):
     )
 
 
-class PRReviewRequest(BaseModel):
-    pr_url: str
-    review_type: str = Field(..., pattern="^(COMMENT|APPROVE|REQUEST_CHANGES)$")
-    body: str = Field(default="")
-
-
-@app.post("/pr/review")
-async def submit_pr_review(review: PRReviewRequest):
-    """Submit a review to a GitHub PR (Comment, Approve, or Request Changes)."""
-    pr_info = extract_pr_url(review.pr_url)
-    if not pr_info:
-        raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
-
-    if not GITHUB_TOKEN:
-        raise HTTPException(status_code=401, detail="GitHub token not configured. Add GITHUB_TOKEN to your .env file.")
-
-    owner, repo, pr_number = pr_info
-
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "User-Agent": "PR-Assistant"
-    }
-
-    # GitHub API requires a body for REQUEST_CHANGES
-    if review.review_type == "REQUEST_CHANGES" and not review.body.strip():
-        raise HTTPException(status_code=400, detail="A comment is required when requesting changes.")
-
-    review_data = {
-        "event": review.review_type,
-    }
-
-    # Only include body if provided
-    if review.body.strip():
-        review_data["body"] = review.body
-
+@app.get("/pr/{owner}/{repo}/{pr_number}")
+async def get_pr_details(owner: str, repo: str, pr_number: int):
+    """Get detailed PR information including merge status."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
-            response = await client.post(url, headers=headers, json=review_data)
+        pr_data = await fetch_github_pr(owner, repo, pr_number)
+        pr = pr_data.get("pr", {})
 
-            if response.status_code == 200 or response.status_code == 201:
-                result = response.json()
-                return {
-                    "success": True,
-                    "review_id": result.get("id"),
-                    "state": result.get("state"),
-                    "message": f"Review submitted successfully as '{review.review_type}'"
-                }
-            elif response.status_code == 422:
-                error_data = response.json()
-                error_msg = error_data.get("message", "Validation failed")
-                # Common issue: can't approve your own PR
-                if "Can not approve your own pull request" in str(error_data):
-                    raise HTTPException(status_code=422, detail="You cannot approve your own pull request.")
-                raise HTTPException(status_code=422, detail=f"GitHub validation error: {error_msg}")
-            elif response.status_code == 404:
-                raise HTTPException(status_code=404, detail="PR not found or you don't have access.")
-            elif response.status_code == 403:
-                raise HTTPException(status_code=403,
-                                    detail="Permission denied. Your token may not have write access to this repository.")
-            else:
-                raise HTTPException(status_code=response.status_code, detail=f"GitHub API error: {response.text}")
+        return {
+            "success": True,
+            "pr_url": pr_data.get("url"),
+            "title": pr.get("title"),
+            "state": pr.get("state"),
+            "merged": pr.get("merged", False),
+            "merged_at": pr.get("merged_at"),
+            "merged_by": (pr.get("merged_by") or {}).get("login") if pr.get("merged") else None,
+            "merge_commit_sha": pr.get("merge_commit_sha"),
+            "author": (pr.get("user") or {}).get("login"),
+            "base_branch": (pr.get("base") or {}).get("ref"),
+            "head_branch": (pr.get("head") or {}).get("ref"),
+            "created_at": pr.get("created_at"),
+            "updated_at": pr.get("updated_at"),
+            "stats": {
+                "files_changed": len(pr_data.get("files", [])),
+                "additions": pr.get("additions", 0),
+                "deletions": pr.get("deletions", 0),
+                "commits": pr.get("commits", 0)
+            },
+            "commits": [{
+                "sha": c.get("sha", "")[:7],
+                "message": c.get("commit", {}).get("message", "").split("\n")[0][:100],
+                "author": c.get("commit", {}).get("author", {}).get("name", "Unknown")
+            } for c in pr_data.get("commits", [])[:20]],
+            "files": [{
+                "filename": f.get("filename"),
+                "status": f.get("status"),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0)
+            } for f in pr_data.get("files", [])[:50]],
+            "reviews": [{
+                "user": r.get("user", {}).get("login"),
+                "state": r.get("state"),
+                "submitted_at": r.get("submitted_at")
+            } for r in pr_data.get("reviews", [])[:10]]
+        }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to submit review: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/pr/comment")
-async def add_pr_comment(pr_url: str, body: str):
-    """Add a general comment to a PR (not a review)."""
-    pr_info = extract_pr_url(pr_url)
-    if not pr_info:
-        raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
-
-    if not GITHUB_TOKEN:
-        raise HTTPException(status_code=401, detail="GitHub token not configured.")
-
-    if not body.strip():
-        raise HTTPException(status_code=400, detail="Comment body is required.")
-
-    owner, repo, pr_number = pr_info
-
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "User-Agent": "PR-Assistant"
-    }
-
+@app.get("/pr/{owner}/{repo}/{pr_number}/commits")
+async def get_pr_commits(owner: str, repo: str, pr_number: int):
+    """Get all commits from a PR (including merged PRs)."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Use issues API for general comments (PRs are issues in GitHub)
-            url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-            response = await client.post(url, headers=headers, json={"body": body})
+        pr_data = await fetch_github_pr(owner, repo, pr_number)
+        commits = pr_data.get("commits", [])
 
-            if response.status_code == 201:
-                result = response.json()
-                return {
-                    "success": True,
-                    "comment_id": result.get("id"),
-                    "html_url": result.get("html_url"),
-                    "message": "Comment added successfully"
-                }
-            else:
-                raise HTTPException(status_code=response.status_code, detail=f"GitHub API error: {response.text}")
+        return {
+            "pr_url": pr_data.get("url"),
+            "pr_merged": pr_data.get("pr", {}).get("merged", False),
+            "total_commits": len(commits),
+            "commits": [{
+                "sha": c.get("sha"),
+                "sha_short": c.get("sha", "")[:7],
+                "message": c.get("commit", {}).get("message", ""),
+                "author": {
+                    "name": c.get("commit", {}).get("author", {}).get("name"),
+                    "email": c.get("commit", {}).get("author", {}).get("email"),
+                    "date": c.get("commit", {}).get("author", {}).get("date")
+                },
+                "url": c.get("html_url")
+            } for c in commits]
+        }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to add comment: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Direct PR Analysis endpoint
 @app.post("/analyze-pr")
-async def analyze_pr(pr_url: str, analysis_type: str = "full"):
-    """Direct endpoint for PR analysis without chat context."""
+async def analyze_pr(
+        pr_url: str,
+        analysis_type: str = "full",
+        include_merged: bool = Query(True, description="Analyze even if PR is merged")
+):
+    """Direct endpoint for PR analysis (supports merged PRs)."""
     pr_info = extract_pr_url(pr_url)
     if not pr_info:
-        raise HTTPException(status_code=400,
-                            detail="Invalid GitHub PR URL. Expected format: https://github.com/owner/repo/pull/123")
+        raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
 
     owner, repo, pr_number = pr_info
     pr_data = await fetch_github_pr(owner, repo, pr_number)
-    pr_context = format_pr_context(pr_data)
     pr = pr_data.get("pr", {})
+    is_merged = pr.get("merged", False)
+
+    if not include_merged and is_merged:
+        return {
+            "pr_url": pr_data.get("url"),
+            "status": "merged",
+            "message": "PR is already merged. Set include_merged=true to analyze.",
+            "merged_at": pr.get("merged_at"),
+            "merged_by": (pr.get("merged_by") or {}).get("login")
+        }
+
+    pr_context = format_pr_context(pr_data)
 
     query_map = {
-        "full": "Provide a comprehensive analysis of this PR including summary, risks, and suggestions.",
+        "full": "Provide a comprehensive analysis including summary, risks, and suggestions.",
         "summary": "Summarize what changed in this PR.",
-        "risks": "Analyze the risks and potential breaking changes in this PR.",
-        "review": "Perform a detailed code review of this PR as a senior developer."
+        "risks": "Analyze the risks and potential breaking changes.",
+        "review": "Perform a detailed code review."
     }
-
     query = query_map.get(analysis_type, query_map["full"])
-    analysis = await analyze_pr_with_ai(pr_context, query, is_structured=True)
 
-    try:
-        parsed = json.loads(analysis)
-    except:
-        parsed = {"response": analysis}
+    system_prompt = MERGED_PR_ANALYSIS_PROMPT if is_merged else PR_ANALYSIS_SYSTEM_PROMPT
 
-    user = pr.get("user", {}) or {}
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{pr_context}\n\n---\n\n{query}"}
+        ],
+        max_tokens=2500
+    )
 
     return {
-        "pr_url": pr_data.get("url", pr_url),
-        "pr_title": pr.get("title", "Unknown"),
-        "author": user.get("login", "Unknown"),
+        "pr_url": pr_data.get("url"),
+        "pr_title": pr.get("title"),
+        "author": (pr.get("user") or {}).get("login"),
+        "state": pr.get("state"),
+        "merged": is_merged,
+        "merged_at": pr.get("merged_at") if is_merged else None,
+        "merged_by": (pr.get("merged_by") or {}).get("login") if is_merged else None,
         "stats": {
             "files_changed": len(pr_data.get("files", [])),
             "additions": pr.get("additions", 0),
             "deletions": pr.get("deletions", 0)
         },
-        "analysis": parsed
-    }
-
-
-# Direct Commit Analysis endpoint
-@app.post("/analyze-commit")
-async def analyze_commit(commit_url: str):
-    """Direct endpoint for commit analysis without chat context."""
-    commit_info = extract_commit_url(commit_url)
-    if not commit_info:
-        raise HTTPException(status_code=400,
-                            detail="Invalid GitHub Commit URL. Expected format: https://github.com/owner/repo/commit/sha")
-
-    owner, repo, commit_sha = commit_info
-    commit_data = await fetch_github_commit(owner, repo, commit_sha)
-    commit_context = format_commit_context(commit_data)
-    commit = commit_data.get("commit", {})
-    commit_info_data = commit.get("commit", {})
-    author = commit_info_data.get("author", {})
-    stats = commit.get("stats", {})
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": COMMIT_ANALYSIS_SYSTEM_PROMPT},
-            {"role": "user", "content": f"{commit_context}\n\n---\n\nAnalyze this commit and provide insights."}
-        ],
-        max_tokens=2000,
-        temperature=0.3
-    )
-    analysis = response.choices[0].message.content
-
-    return {
-        "commit_url": commit_data.get("url", commit_url),
-        "commit_sha": commit.get("sha", "")[:7],
-        "commit_message": commit_info_data.get("message", "").split("\n")[0],
-        "author": author.get("name", "Unknown"),
-        "date": author.get("date", ""),
-        "stats": {
-            "files_changed": len(commit.get("files", [])),
-            "additions": stats.get("additions", 0),
-            "deletions": stats.get("deletions", 0)
-        },
-        "analysis": {"response": analysis}
+        "analysis": response.choices[0].message.content
     }
 
 
