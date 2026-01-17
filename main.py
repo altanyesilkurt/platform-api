@@ -6,10 +6,10 @@ from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
 from openai import OpenAI
 from dotenv import load_dotenv
-from promts.chat_with_pr_context_promt import CHAT_WITH_PR_CONTEXT_PROMPT
 from promts.commit_analysis_system_prompt import COMMIT_ANALYSIS_SYSTEM_PROMPT
 from promts.general_query_system_prompt import GENERAL_QUERY_SYSTEM_PROMPT
 from promts.pr_analysis_system_prompt import PR_ANALYSIS_SYSTEM_PROMPT
+from promts.follow_up_conversation_prompt import FOLLOW_UP_CONVERSATION_PROMPT
 import os
 import json
 import re
@@ -50,65 +50,22 @@ class MessageCreate(BaseModel):
     message: str = Field(..., min_length=1)
 
 
-class PRAnalysisResponse(BaseModel):
-    summary: str
-    risk_level: str
-    risk_details: List[str]
-    key_changes: List[str]
-    suggestions: List[str]
-    breaking_changes: List[str]
-    files_affected: int
-    lines_added: int
-    lines_deleted: int
-
-
-# GitHub URL patterns
+# Patterns
 PR_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/pull/(\d+)'
 COMMIT_URL_PATTERN = r'https://github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+)'
 
-# Keywords that indicate PR/code review/commit related queries
-PR_RELATED_KEYWORDS = [
-    'pull request', 'pr', 'code review', 'github', 'merge', 'commit', 'branch',
-    'diff', 'repository', 'repo', 'git', 'review this', 'analyze this pr',
-    'check this pr', 'look at this pr', 'examine this', 'code changes',
-    'file changes', 'breaking changes', 'risk assessment', 'code analysis',
-    '/pull/', '/commit/', 'github.com', 'approve', 'request changes', 'mergeable',
-    'conflicts', 'base branch', 'head branch', 'squash', 'rebase',
-    'analyze commit', 'review commit', 'commit changes', 'sha'
-]
+def extract_pr_url(message: str) -> Optional[tuple]:
+    match = re.search(PR_URL_PATTERN, message)
+    if match:
+        return (match.group(1), match.group(2), int(match.group(3)))
+    return None
 
 
-def is_pr_related_query(message: str, chat_history: List[Dict] = None) -> bool:
-    """Determine if the query is related to GitHub PR/code review/commit."""
-    message_lower = message.lower()
-
-    # Check for PR URL in the message
-    if re.search(PR_URL_PATTERN, message):
-        return True
-
-    # Check for Commit URL in the message
-    if re.search(COMMIT_URL_PATTERN, message):
-        return True
-
-    # Check for PR-related keywords
-    for keyword in PR_RELATED_KEYWORDS:
-        if keyword in message_lower:
-            return True
-
-    # Check conversation history for PR/commit context
-    if chat_history:
-        for msg in chat_history[-5:]:  # Check last 5 messages
-            content = msg.get("content", "").lower()
-            if re.search(PR_URL_PATTERN, content):
-                return True
-            if re.search(COMMIT_URL_PATTERN, content):
-                return True
-            # If recent conversation mentions PR/commit-specific terms
-            if any(kw in content for kw in
-                   ['pull request', 'github.com/pull', 'pr #', 'this pr', 'this commit', 'commit sha']):
-                return True
-
-    return False
+def extract_commit_url(message: str) -> Optional[tuple]:
+    match = re.search(COMMIT_URL_PATTERN, message)
+    if match:
+        return (match.group(1), match.group(2), match.group(3))
+    return None
 
 
 async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
@@ -121,114 +78,64 @@ async def fetch_github_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
     else:
         print("WARNING: No GITHUB_TOKEN set. API rate limits will be very restrictive.")
 
-    print(f"Fetching PR: {owner}/{repo}#{pr_number}")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        pr_response = await client.get(pr_url, headers=headers)
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-            pr_response = await client.get(pr_url, headers=headers)
+        if pr_response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"PR #{pr_number} not found in {owner}/{repo}")
+        elif pr_response.status_code == 403:
+            raise HTTPException(status_code=403, detail="GitHub API rate limit or access denied")
+        elif pr_response.status_code != 200:
+            raise HTTPException(status_code=pr_response.status_code, detail=f"GitHub API error")
 
-            print(f"GitHub PR response status: {pr_response.status_code}")
+        pr_data = pr_response.json()
 
-            if pr_response.status_code == 404:
-                raise HTTPException(status_code=404,
-                                    detail=f"PR #{pr_number} not found in {owner}/{repo}. It may not exist or you don't have access to this repository.")
-            elif pr_response.status_code == 403:
-                error_data = pr_response.json() if pr_response.text else {}
-                if "rate limit" in error_data.get("message", "").lower():
-                    raise HTTPException(status_code=403,
-                                        detail="GitHub API rate limit exceeded. Please add a GITHUB_TOKEN to your .env file.")
-                raise HTTPException(status_code=403,
-                                    detail=f"Access denied to {owner}/{repo}. For private repos, ensure your GITHUB_TOKEN has 'repo' scope.")
-            elif pr_response.status_code != 200:
-                raise HTTPException(status_code=pr_response.status_code,
-                                    detail=f"GitHub API error (status {pr_response.status_code}): {pr_response.text[:200]}")
+        # Fetch diff
+        diff_content = ""
+        try:
+            diff_headers = {**headers, "Accept": "application/vnd.github.v3.diff"}
+            diff_response = await client.get(pr_url, headers=diff_headers)
+            if diff_response.status_code == 200:
+                diff_content = diff_response.text or ""
+        except:
+            pass
 
-            pr_data = pr_response.json()
+        # Fetch files
+        files_data = []
+        try:
+            files_response = await client.get(f"{pr_url}/files", headers=headers)
+            if files_response.status_code == 200:
+                files_data = files_response.json() or []
+        except:
+            pass
 
-            if not pr_data:
-                raise HTTPException(status_code=500, detail="GitHub returned empty PR data")
+        # Fetch commits
+        commits_data = []
+        try:
+            commits_response = await client.get(f"{pr_url}/commits", headers=headers)
+            if commits_response.status_code == 200:
+                commits_data = commits_response.json() or []
+        except:
+            pass
 
-            print(f"PR Title: {pr_data.get('title', 'N/A')}, State: {pr_data.get('state', 'N/A')}")
+        # Fetch comments
+        comments_data = []
+        try:
+            comments_response = await client.get(f"{pr_url}/comments", headers=headers)
+            if comments_response.status_code == 200:
+                comments_data = comments_response.json() or []
+        except:
+            pass
 
-            diff_content = ""
-            try:
-                diff_headers = {**headers, "Accept": "application/vnd.github.v3.diff"}
-                diff_response = await client.get(pr_url, headers=diff_headers)
-                if diff_response.status_code == 200:
-                    diff_content = diff_response.text or ""
-            except Exception as e:
-                print(f"Warning: Failed to fetch diff: {e}")
-
-            # Fetch PR files
-            files_data = []
-            try:
-                files_url = f"{pr_url}/files"
-                files_response = await client.get(files_url, headers=headers)
-                if files_response.status_code == 200:
-                    files_data = files_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch files: {e}")
-
-            # Fetch PR commits
-            commits_data = []
-            try:
-                commits_url = f"{pr_url}/commits"
-                commits_response = await client.get(commits_url, headers=headers)
-                if commits_response.status_code == 200:
-                    commits_data = commits_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch commits: {e}")
-
-            # Fetch PR comments
-            comments_data = []
-            try:
-                comments_url = f"{pr_url}/comments"
-                comments_response = await client.get(comments_url, headers=headers)
-                if comments_response.status_code == 200:
-                    comments_data = comments_response.json() or []
-            except Exception as e:
-                print(f"Warning: Failed to fetch comments: {e}")
-
-            return {
-                "pr": pr_data,
-                "diff": diff_content[:50000] if diff_content else "",
-                "files": files_data[:100] if files_data else [],
-                "commits": commits_data[:50] if commits_data else [],
-                "comments": comments_data[:50] if comments_data else [],
-                "url": f"https://github.com/{owner}/{repo}/pull/{pr_number}"
-            }
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504,
-                            detail=f"Request to GitHub timed out. The repository {owner}/{repo} may be slow to respond.")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Network error connecting to GitHub: {str(e)}")
-    except Exception as e:
-        print(f"Unexpected error in fetch_github_pr: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error fetching PR: {type(e).__name__}: {str(e)}")
-
-
-def extract_pr_url(message: str) -> Optional[tuple]:
-    """Extract GitHub PR URL from message."""
-    match = re.search(PR_URL_PATTERN, message)
-    if match:
-        result = (match.group(1), match.group(2), int(match.group(3)))
-        print(f"Extracted PR URL: owner={result[0]}, repo={result[1]}, pr={result[2]}")
-        return result
-    print(f"No PR URL found in message: {message[:100]}...")
-    return None
-
-
-def extract_commit_url(message: str) -> Optional[tuple]:
-    """Extract GitHub Commit URL from message."""
-    match = re.search(COMMIT_URL_PATTERN, message)
-    if match:
-        result = (match.group(1), match.group(2), match.group(3))
-        print(f"Extracted Commit URL: owner={result[0]}, repo={result[1]}, sha={result[2]}")
-        return result
-    return None
+        return {
+            "pr": pr_data,
+            "diff": diff_content[:50000] if diff_content else "",
+            "files": files_data[:100] if files_data else [],
+            "commits": commits_data[:50] if commits_data else [],
+            "comments": comments_data[:50] if comments_data else [],
+            "url": f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+        }
 
 
 async def fetch_github_commit(owner: str, repo: str, commit_sha: str) -> Dict[str, Any]:
@@ -239,161 +146,163 @@ async def fetch_github_commit(owner: str, repo: str, commit_sha: str) -> Dict[st
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    else:
-        print("WARNING: No GITHUB_TOKEN set. API rate limits will be very restrictive.")
 
-    print(f"Fetching Commit: {owner}/{repo}@{commit_sha[:7]}")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        commit_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{commit_sha}"
+        response = await client.get(commit_url, headers=headers)
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            commit_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{commit_sha}"
-            commit_response = await client.get(commit_url, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch commit")
 
-            print(f"GitHub Commit response status: {commit_response.status_code}")
-
-            if commit_response.status_code == 404:
-                raise HTTPException(status_code=404,
-                                    detail=f"Commit {commit_sha[:7]} not found in {owner}/{repo}.")
-            elif commit_response.status_code == 403:
-                error_data = commit_response.json() if commit_response.text else {}
-                if "rate limit" in error_data.get("message", "").lower():
-                    raise HTTPException(status_code=403,
-                                        detail="GitHub API rate limit exceeded.")
-                raise HTTPException(status_code=403,
-                                    detail=f"Access denied to {owner}/{repo}.")
-            elif commit_response.status_code != 200:
-                raise HTTPException(status_code=commit_response.status_code,
-                                    detail=f"GitHub API error: {commit_response.text[:200]}")
-
-            commit_data = commit_response.json()
-
-            if not commit_data:
-                raise HTTPException(status_code=500, detail="GitHub returned empty commit data")
-
-            return {
-                "commit": commit_data,
-                "url": f"https://github.com/{owner}/{repo}/commit/{commit_sha}"
-            }
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504,
-                            detail=f"Request to GitHub timed out.")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Network error connecting to GitHub: {str(e)}")
-    except Exception as e:
-        print(f"Unexpected error in fetch_github_commit: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        return {"commit": response.json(), "url": f"https://github.com/{owner}/{repo}/commit/{commit_sha}"}
 
 
-def format_commit_context(commit_data: Dict[str, Any]) -> str:
-    """Format commit data for AI context."""
-    commit = commit_data.get("commit", {})
-    commit_info = commit.get("commit", {})
-    author = commit_info.get("author", {})
-    committer = commit_info.get("committer", {})
-    stats = commit.get("stats", {})
-    files = commit.get("files", [])
-
-    files_summary = "\n".join([
-        f"- `{f.get('filename', 'unknown')}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)}) [{f.get('status', 'unknown')}]"
-        for f in (files or [])[:30]
-    ]) or "No files information available"
-
-    # Build patches summary
-    patches_summary = ""
-    for f in (files or [])[:10]:
-        patch = f.get("patch", "")
-        if patch:
-            patches_summary += f"\n### `{f.get('filename', 'unknown')}`\n```diff\n{patch[:3000]}\n```\n"
-
-    return f"""
-## Commit: {commit_info.get('message', 'No message')[:200]}
-
-**URL:** {commit_data.get('url', 'N/A')}
-**SHA:** {commit.get('sha', 'unknown')}
-**Author:** {author.get('name', 'Unknown')} <{author.get('email', '')}>
-**Date:** {author.get('date', 'N/A')}
-**Committer:** {committer.get('name', 'Unknown')}
-
-### Full Commit Message:
-{commit_info.get('message', 'No message provided')}
-
-### Statistics:
-- Files Changed: {len(files) if files else 0}
-- Additions: {stats.get('additions', 0)}
-- Deletions: {stats.get('deletions', 0)}
-- Total Changes: {stats.get('total', 0)}
-
-### Files Changed:
-{files_summary}
-
-### Code Changes:
-{patches_summary if patches_summary else 'No patch data available'}
-"""
-
-def format_pr_context(pr_data: Dict[str, Any]) -> str:
-    """Format PR data for AI context."""
+def format_pr_for_conversation(pr_data: Dict[str, Any]) -> str:
+    """Format PR data in a way that's useful for conversation."""
     pr = pr_data.get("pr", {})
     files = pr_data.get("files", [])
     diff = pr_data.get("diff", "")
-
-    # Safely get nested values
     user = pr.get("user", {}) or {}
     base = pr.get("base", {}) or {}
     head = pr.get("head", {}) or {}
 
-    files_summary = "\n".join([
-        f"- {f.get('filename', 'unknown')} (+{f.get('additions', 0)}/-{f.get('deletions', 0)}) [{f.get('status', 'unknown')}]"
-        for f in (files or [])[:30]
-    ]) or "No files information available"
+    # Group files by type/directory for better context
+    files_by_dir = {}
+    for f in files:
+        path = f.get("filename", "")
+        dir_name = "/".join(path.split("/")[:-1]) or "root"
+        if dir_name not in files_by_dir:
+            files_by_dir[dir_name] = []
+        files_by_dir[dir_name].append({
+            "name": path.split("/")[-1],
+            "full_path": path,
+            "status": f.get("status", ""),
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+            "patch": f.get("patch", "")[:3000]
+        })
+
+    files_summary = ""
+    for dir_name, dir_files in files_by_dir.items():
+        files_summary += f"\n**{dir_name}/**\n"
+        for f in dir_files:
+            files_summary += f"  - `{f['name']}` ({f['status']}, +{f['additions']}/-{f['deletions']})\n"
 
     return f"""
-## Pull Request: {pr.get('title', 'Unknown Title')}
-**URL:** {pr_data.get('url', 'N/A')}
+## PR Context for Conversation
+
+**Title:** {pr.get('title', 'Unknown')}
 **Author:** {user.get('login', 'Unknown')}
-**State:** {pr.get('state', 'unknown')}
-**Base Branch:** {base.get('ref', 'unknown')} ← **Head Branch:** {head.get('ref', 'unknown')}
-**Created:** {pr.get('created_at', 'N/A')}
-**Updated:** {pr.get('updated_at', 'N/A')}
+**Branch:** {head.get('ref', '?')} → {base.get('ref', '?')}
+**State:** {pr.get('state', 'unknown')} | Merged: {pr.get('merged', False)}
+**URL:** {pr_data.get('url', 'N/A')}
 
-### Description:
-{(pr.get('body') or 'No description provided')[:2000]}
+### Description
+{(pr.get('body') or 'No description provided')[:1500]}
 
-### Statistics:
-- Files Changed: {len(files) if files else 0}
-- Additions: {pr.get('additions', 0)}
-- Deletions: {pr.get('deletions', 0)}
-- Commits: {pr.get('commits', 0)}
+### Stats
+- **{len(files)} files** changed
+- **+{pr.get('additions', 0)}** additions / **-{pr.get('deletions', 0)}** deletions
+- **{pr.get('commits', 0)}** commits
 
-### Files Changed:
+### Files Changed (grouped by directory)
 {files_summary}
 
-### Code Diff (truncated):
+### Code Changes (Diff)
 ```diff
-{diff[:30000] if diff else 'No diff available'}
+{diff[:30000]}
 ```
+
+---
+Use this context to have a natural conversation about the PR. Reference specific files and code when answering questions.
 """
 
 
+def format_commit_for_conversation(commit_data: Dict[str, Any]) -> str:
+    """Format commit data for conversation."""
+    commit = commit_data.get("commit", {})
+    info = commit.get("commit", {})
+    author = info.get("author", {})
+    stats = commit.get("stats", {})
+    files = commit.get("files", [])
+
+    files_summary = "\n".join([
+        f"- `{f.get('filename')}` ({f.get('status')}, +{f.get('additions', 0)}/-{f.get('deletions', 0)})"
+        for f in (files or [])[:20]
+    ])
+
+    patches = ""
+    for f in (files or [])[:8]:
+        if f.get("patch"):
+            patches += f"\n### `{f.get('filename')}`\n```diff\n{f.get('patch', '')[:2000]}\n```\n"
+
+    return f"""
+## Commit Context for Conversation
+
+**Message:** {info.get('message', 'No message')}
+**Author:** {author.get('name', 'Unknown')} ({author.get('email', '')})
+**Date:** {author.get('date', 'N/A')}
+**SHA:** {commit.get('sha', '')[:10]}
+**URL:** {commit_data.get('url', 'N/A')}
+
+### Stats
+- **{len(files) if files else 0}** files changed
+- **+{stats.get('additions', 0)}** / **-{stats.get('deletions', 0)}**
+
+### Files Changed
+{files_summary}
+
+### Code Changes
+{patches if patches else 'No patch data available'}
+
+---
+Use this context to discuss the commit naturally.
+"""
+
+
+def get_chat_context(chat_id: str) -> Dict[str, Any]:
+    """Retrieve stored context for a chat (PR/commit being discussed)."""
+    try:
+        response = supabase.table("chat_contexts").select("*").eq("chat_id", chat_id).single().execute()
+        return response.data if response.data else {}
+    except:
+        return {}
+
+
+def save_chat_context(chat_id: str, context_type: str, context_data: Dict[str, Any]):
+    """Save or update context for a chat."""
+    try:
+        existing = supabase.table("chat_contexts").select("id").eq("chat_id", chat_id).execute()
+        if existing.data:
+            supabase.table("chat_contexts").update({
+                "context_type": context_type,
+                "context_data": json.dumps(context_data),
+                "updated_at": "now()"
+            }).eq("chat_id", chat_id).execute()
+        else:
+            supabase.table("chat_contexts").insert({
+                "chat_id": chat_id,
+                "context_type": context_type,
+                "context_data": json.dumps(context_data)
+            }).execute()
+    except Exception as e:
+        print(f"Warning: Could not save chat context: {e}")
+
+
 def generate_chat_title(user_message: str, ai_response: str) -> str:
-    """Generate a short title for the chat."""
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system",
-                 "content": "Generate a short title (3-6 words max) for this conversation. Return ONLY the title, no quotes."},
-                {"role": "user",
-                 "content": f"User asked: {user_message[:200]}\n\nAssistant replied: {ai_response[:300]}"}
+                 "content": "Generate a short, conversational title (3-6 words) for this chat. Return ONLY the title."},
+                {"role": "user", "content": f"User: {user_message[:200]}\nAssistant: {ai_response[:300]}"}
             ],
-            max_tokens=20,
-            temperature=0.7
+            max_tokens=20
         )
-        title = response.choices[0].message.content.strip().strip('"\'')
-        return title[:50] if len(title) > 50 else title
+        return response.choices[0].message.content.strip().strip('"\'')[:50]
     except:
-        return "PR Review Chat"
+        return "Code Review Chat"
 
 
 def is_first_exchange(chat_id: str) -> bool:
@@ -401,37 +310,6 @@ def is_first_exchange(chat_id: str) -> bool:
     return response.count <= 1
 
 
-async def analyze_pr_with_ai(pr_context: str, user_query: str, is_structured: bool = True) -> str:
-    """Analyze PR using OpenAI."""
-    system_prompt = PR_ANALYSIS_SYSTEM_PROMPT if is_structured else CHAT_WITH_PR_CONTEXT_PROMPT
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_query}"}
-        ],
-        max_tokens=2000,
-        temperature=0.3
-    )
-    return response.choices[0].message.content
-
-
-def detect_query_type(message: str) -> str:
-    """Detect the type of PR-related query."""
-    message_lower = message.lower()
-    if any(word in message_lower for word in ['summarize', 'summary', 'what changed', 'overview']):
-        return 'summarize'
-    elif any(word in message_lower for word in ['review', 'code review', 'feedback']):
-        return 'review'
-    elif any(word in message_lower for word in ['risk', 'risky', 'dangerous', 'breaking', 'break']):
-        return 'risk_analysis'
-    elif any(word in message_lower for word in ['suggest', 'improve', 'issues', 'follow-up']):
-        return 'suggestions'
-    return 'general'
-
-
-# Existing endpoints
 @app.get("/chats")
 async def get_chats():
     response = supabase.table("chats").select("*").order("updated_at", desc=True).execute()
@@ -453,16 +331,15 @@ async def get_chat(chat_id: str):
 @app.put("/chats/{chat_id}")
 async def update_chat(chat_id: str, chat_update: ChatUpdate):
     response = supabase.table("chats").update({"title": chat_update.title}).eq("id", chat_id).execute()
-    if not response.data:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    return response.data[0]
+    return response.data[0] if response.data else None
 
 
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str):
     supabase.table("messages").delete().eq("chat_id", chat_id).execute()
+    supabase.table("chat_contexts").delete().eq("chat_id", chat_id).execute()
     supabase.table("chats").delete().eq("id", chat_id).execute()
-    return {"success": True, "deleted_id": chat_id}
+    return {"success": True}
 
 
 @app.get("/chats/{chat_id}/messages")
@@ -471,9 +348,8 @@ async def get_messages(chat_id: str):
     return response.data
 
 
-# Enhanced chat endpoint with PR intelligence
-@app.post("/chat")
-async def send_message(message_data: MessageCreate):
+@app.post("/chat/stream")
+async def send_message_stream(message_data: MessageCreate):
     user_message = message_data.message
     chat_id = message_data.chat_id
     first_exchange = is_first_exchange(chat_id)
@@ -483,110 +359,28 @@ async def send_message(message_data: MessageCreate):
         "chat_id": chat_id, "role": "user", "content": user_message
     }).execute()
 
-    # Check for PR URL
+    # Check for URLs in message
     pr_info = extract_pr_url(user_message)
-    pr_context = None
-    pr_metadata = None
-    pr_fetch_error = None
-
-    if pr_info:
-        owner, repo, pr_number = pr_info
-        try:
-            pr_data = await fetch_github_pr(owner, repo, pr_number)
-            pr_context = format_pr_context(pr_data)
-            pr_metadata = {
-                "pr_url": pr_data["url"],
-                "pr_title": pr_data["pr"]["title"],
-                "files_changed": len(pr_data["files"]),
-                "additions": pr_data["pr"]["additions"],
-                "deletions": pr_data["pr"]["deletions"]
-            }
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"GitHub API error: {str(e)}")
-
-    # Get conversation history
-    history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
-
-    # Build messages
-    if pr_context:
-        query_type = detect_query_type(user_message)
-        is_structured = query_type in ['summarize', 'review', 'risk_analysis']
-        ai_response = await analyze_pr_with_ai(pr_context, user_message, is_structured)
-    else:
-        # Check if query is PR-related or general
-        is_pr_query = is_pr_related_query(user_message, history.data)
-
-        if is_pr_query:
-            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
-            max_tokens = 2000
-        else:
-            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
-            max_tokens = 4000
-
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
-
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=max_tokens
-            )
-            ai_response = response.choices[0].message.content
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"AI error: {str(e)}")
-
-    # Save assistant response
-    assistant_msg = supabase.table("messages").insert({
-        "chat_id": chat_id, "role": "assistant", "content": ai_response
-    }).execute()
-
-    # Generate title if first exchange
-    new_title = None
-    if first_exchange:
-        new_title = generate_chat_title(user_message, ai_response)
-        supabase.table("chats").update({"title": new_title}).eq("id", chat_id).execute()
-
-    return {
-        "id": assistant_msg.data[0]["id"],
-        "role": "assistant",
-        "content": ai_response,
-        "new_title": new_title,
-        "pr_metadata": pr_metadata
-    }
-
-
-# Streaming endpoint with PR intelligence
-@app.post("/chat/stream")
-async def send_message_stream(message_data: MessageCreate):
-    user_message = message_data.message
-    chat_id = message_data.chat_id
-    first_exchange = is_first_exchange(chat_id)
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id, "role": "user", "content": user_message
-    }).execute()
-
-    # Check for PR URL
-    pr_info = extract_pr_url(user_message)
-    # Check for Commit URL
     commit_info = extract_commit_url(user_message)
+
+    # Get existing context for this chat
+    existing_context = get_chat_context(chat_id)
 
     pr_context = None
     commit_context = None
-    pr_metadata = None
-    commit_metadata = None
+    metadata = None
     fetch_error = None
 
-    # Handle PR URL
+    # Fetch new PR if URL provided
     if pr_info:
         owner, repo, pr_number = pr_info
         try:
             pr_data = await fetch_github_pr(owner, repo, pr_number)
-            pr_context = format_pr_context(pr_data)
             pr = pr_data.get("pr", {})
             pr_state = pr.get("state", "unknown")
             pr_merged = pr.get("merged", False)
 
-            # Extract commits
+            # Build commits list for metadata
             commits = []
             for c in pr_data.get("commits", [])[:10]:
                 c_info = c.get("commit", {})
@@ -596,7 +390,7 @@ async def send_message_stream(message_data: MessageCreate):
                     "author": c_info.get("author", {}).get("name", "Unknown")
                 })
 
-            # Extract files with patches
+            # Build files list with patches for metadata
             files = []
             for f in pr_data.get("files", [])[:20]:
                 files.append({
@@ -607,7 +401,9 @@ async def send_message_stream(message_data: MessageCreate):
                     "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
                 })
 
-            pr_metadata = {
+            # Build full metadata (same as original)
+            metadata = {
+                "type": "pr",
                 "pr_url": pr_data.get("url", f"https://github.com/{owner}/{repo}/pull/{pr_number}"),
                 "pr_title": pr.get("title", "Unknown PR"),
                 "pr_body": (pr.get("body") or "No description provided")[:500],
@@ -621,36 +417,53 @@ async def send_message_stream(message_data: MessageCreate):
                 "files": files
             }
 
-            if pr_state == "closed" or pr_merged:
+            # Check if closed/merged
+            if pr_merged or pr_state == "closed":
                 merged_by = (pr.get("merged_by") or {}).get("login", "")
                 if pr_merged:
-                    status_message = f"This PR has already been merged{' by ' + merged_by if merged_by else ''}. No analysis needed."
+                    status_message = f"This PR has already been merged{' by ' + merged_by if merged_by else ''}. I can still discuss the changes if you'd like!"
                 else:
-                    status_message = "This PR has been closed without merging. No analysis needed."
-                pr_metadata["status_message"] = status_message
-                pr_context = None
+                    status_message = "This PR has been closed without merging. I can still discuss the changes if you'd like!"
+                metadata["status_message"] = status_message
 
-            print(f"Successfully fetched PR: {pr_metadata['pr_title']} (state: {pr_state}, merged: {pr_merged})")
+                # Still save context so user can ask follow-up questions about closed/merged PRs
+                pr_context_for_storage = format_pr_for_conversation(pr_data)
+                save_chat_context(chat_id, "pr", {
+                    "url": pr_data["url"],
+                    "title": pr.get("title"),
+                    "formatted_context": pr_context_for_storage,
+                    "files": [f.get("filename") for f in pr_data.get("files", [])]
+                })
+            else:
+                # Only set pr_context for open PRs (for AI analysis)
+                pr_context = format_pr_for_conversation(pr_data)
+                # Save context for follow-ups
+                save_chat_context(chat_id, "pr", {
+                    "url": pr_data["url"],
+                    "title": pr.get("title"),
+                    "formatted_context": pr_context,
+                    "files": [f.get("filename") for f in pr_data.get("files", [])]
+                })
+
+            print(f"Successfully fetched PR: {metadata['pr_title']} (state: {pr_state}, merged: {pr_merged})")
+
         except HTTPException as e:
-            print(f"HTTP ERROR fetching PR: {e.detail}")
             fetch_error = e.detail
         except Exception as e:
-            print(f"ERROR fetching PR: {str(e)}")
             fetch_error = str(e)
 
-    # Handle Commit URL
+    # Fetch new commit if URL provided
     elif commit_info:
         owner, repo, commit_sha = commit_info
         try:
             commit_data = await fetch_github_commit(owner, repo, commit_sha)
-            commit_context = format_commit_context(commit_data)
             commit = commit_data.get("commit", {})
             commit_info_data = commit.get("commit", {})
             author = commit_info_data.get("author", {})
             stats = commit.get("stats", {})
             files = commit.get("files", [])
 
-            # Extract files with patches for metadata
+            # Build files list with patches for metadata
             files_list = []
             for f in (files or [])[:20]:
                 files_list.append({
@@ -661,12 +474,13 @@ async def send_message_stream(message_data: MessageCreate):
                     "patch": f.get("patch", "")[:5000] if f.get("patch") else ""
                 })
 
-            commit_metadata = {
+            # Build full commit metadata (same as original)
+            metadata = {
                 "type": "commit",
                 "commit_url": commit_data.get("url"),
                 "commit_sha": commit.get("sha", "")[:7],
                 "commit_sha_full": commit.get("sha", ""),
-                "commit_message": commit_info_data.get("message", ""),  # Full message including description
+                "commit_message": commit_info_data.get("message", ""),
                 "commit_author": author.get("name", "Unknown"),
                 "commit_author_email": author.get("email", ""),
                 "commit_date": author.get("date", ""),
@@ -677,81 +491,116 @@ async def send_message_stream(message_data: MessageCreate):
                 "files": files_list
             }
 
-            print(f"Successfully fetched Commit: {commit_metadata['commit_sha']} - {commit_metadata['commit_message']}")
-        except HTTPException as e:
-            print(f"HTTP ERROR fetching Commit: {e.detail}")
-            fetch_error = e.detail
+            commit_context = format_commit_for_conversation(commit_data)
+            save_chat_context(chat_id, "commit", {
+                "url": commit_data["url"],
+                "sha": commit.get("sha", "")[:10],
+                "message": commit_info_data.get("message", ""),
+                "formatted_context": commit_context
+            })
+
+            print(f"Successfully fetched Commit: {metadata['commit_sha']} - {metadata['commit_message'][:50]}")
         except Exception as e:
-            print(f"ERROR fetching Commit: {str(e)}")
             fetch_error = str(e)
 
+    # Use existing context for follow-ups
+    elif existing_context:
+        context_data = json.loads(existing_context.get("context_data", "{}"))
+        if existing_context.get("context_type") == "pr":
+            pr_context = context_data.get("formatted_context", "")
+        elif existing_context.get("context_type") == "commit":
+            commit_context = context_data.get("formatted_context", "")
+
+    # Get conversation history
     history = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at").execute()
 
-    # Determine system prompt and max tokens based on query type
     if pr_context:
-        system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {user_message}"}
-        ]
-        max_tokens = 2000
+        if pr_info:  # NEW PR URL in this message → Structured analysis
+            system_prompt = PR_ANALYSIS_SYSTEM_PROMPT
+            user_content = f"{pr_context}\n\n---\n\nUser Request: {user_message}"
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
+        else:  # Follow-up on existing PR → Conversational
+            system_prompt = FOLLOW_UP_CONVERSATION_PROMPT
+            user_content = f"""## PR Context (from earlier in conversation)
+{pr_context}
+
+---
+
+**User's follow-up question:** {user_message}
+
+Provide a detailed, conversational response. If they're asking about a specific class, model, file, or code pattern, show the actual code and explain it thoroughly."""
+            messages = [{"role": "system", "content": system_prompt}]
+            # Include conversation history for context
+            for m in history.data[-6:]:
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": user_content})
+
     elif commit_context:
-        system_prompt = COMMIT_ANALYSIS_SYSTEM_PROMPT
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",
-             "content": f"{commit_context}\n\n---\n\nUser Request: Analyze this commit and provide insights."}
-        ]
-        max_tokens = 2000
+        if commit_info:  # NEW commit URL → Structured analysis
+            system_prompt = COMMIT_ANALYSIS_SYSTEM_PROMPT
+            user_content = f"{commit_context}\n\n---\n\nUser Request: Analyze this commit and provide insights."
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
+        else:  # Follow-up on existing commit → Conversational
+            system_prompt = FOLLOW_UP_CONVERSATION_PROMPT
+            user_content = f"""## Commit Context (from earlier in conversation)
+{commit_context}
+
+---
+
+**User's follow-up question:** {user_message}
+
+Provide a detailed, conversational response."""
+            messages = [{"role": "system", "content": system_prompt}]
+            for m in history.data[-6:]:
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": user_content})
+
     else:
-        # Check if query is PR-related or general
-        is_pr_query = is_pr_related_query(user_message, history.data)
-
-        if is_pr_query:
-            system_prompt = CHAT_WITH_PR_CONTEXT_PROMPT
-            max_tokens = 2000
-        else:
-            system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
-            max_tokens = 4000
-
+        # General conversation (no PR/commit context)
+        system_prompt = GENERAL_QUERY_SYSTEM_PROMPT
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": m["role"], "content": m["content"]} for m in history.data])
 
     async def generate():
         full_response = ""
         try:
-            # Handle fetch error
-            if (pr_info or commit_info) and fetch_error:
-                error_msg = f"Unable to fetch from GitHub. {fetch_error}"
+            if fetch_error:
+                error_msg = f"Hmm, I ran into an issue fetching that from GitHub: {fetch_error}\n\nCould you double-check the URL? Or if it's a private repo, make sure the GitHub token has access."
                 yield f"data: {json.dumps({'content': error_msg})}\n\n"
-
                 result = supabase.table("messages").insert({
                     "chat_id": chat_id, "role": "assistant", "content": error_msg
                 }).execute()
-                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id']})}\n\n"
                 return
 
-            # Handle closed/merged PR
-            if pr_metadata and pr_metadata.get("status_message"):
-                status_msg = pr_metadata["status_message"]
-                yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
-                yield f"data: {json.dumps({'content': status_msg})}\n\n"
+            # Send metadata first (for PR/Commit card in UI)
+            if metadata:
+                # Use pr_metadata or commit_metadata key based on type for frontend compatibility
+                if metadata.get("type") == "pr":
+                    yield f"data: {json.dumps({'pr_metadata': metadata})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'commit_metadata': metadata})}\n\n"
 
+            # Handle closed/merged PR - just show status message, no AI analysis
+            if metadata and metadata.get("status_message"):
+                status_msg = metadata["status_message"]
+                yield f"data: {json.dumps({'content': status_msg})}\n\n"
                 result = supabase.table("messages").insert({
                     "chat_id": chat_id, "role": "assistant", "content": status_msg
                 }).execute()
-                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id'], 'new_title': None})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'id': result.data[0]['id']})}\n\n"
                 return
 
-            # Send metadata first if available
-            if pr_metadata:
-                yield f"data: {json.dumps({'pr_metadata': pr_metadata})}\n\n"
-            elif commit_metadata:
-                yield f"data: {json.dumps({'commit_metadata': commit_metadata})}\n\n"
-
             stream = openai_client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=max_tokens, stream=True
+                model="gpt-4o", messages=messages, max_tokens=2000, stream=True, temperature=0.7
             )
+
             for chunk in stream:
                 if chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
@@ -771,10 +620,8 @@ async def send_message_stream(message_data: MessageCreate):
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    return StreamingResponse(
-        generate(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
-    )
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
 class PRReviewRequest(BaseModel):
@@ -818,7 +665,7 @@ async def submit_pr_review(review: PRReviewRequest):
             url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
             response = await client.post(url, headers=headers, json=review_data)
 
-            if response.status_code == 200 or response.status_code == 201:
+            if response.status_code in [200, 201]:
                 result = response.json()
                 return {
                     "success": True,
@@ -829,7 +676,6 @@ async def submit_pr_review(review: PRReviewRequest):
             elif response.status_code == 422:
                 error_data = response.json()
                 error_msg = error_data.get("message", "Validation failed")
-                # Common issue: can't approve your own PR
                 if "Can not approve your own pull request" in str(error_data):
                     raise HTTPException(status_code=422, detail="You cannot approve your own pull request.")
                 raise HTTPException(status_code=422, detail=f"GitHub validation error: {error_msg}")
@@ -869,7 +715,6 @@ async def add_pr_comment(pr_url: str, body: str):
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Use issues API for general comments (PRs are issues in GitHub)
             url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
             response = await client.post(url, headers=headers, json={"body": body})
 
@@ -889,7 +734,6 @@ async def add_pr_comment(pr_url: str, body: str):
         raise HTTPException(status_code=500, detail=f"Failed to add comment: {str(e)}")
 
 
-# Direct PR Analysis endpoint
 @app.post("/analyze-pr")
 async def analyze_pr(pr_url: str, analysis_type: str = "full"):
     """Direct endpoint for PR analysis without chat context."""
@@ -900,7 +744,7 @@ async def analyze_pr(pr_url: str, analysis_type: str = "full"):
 
     owner, repo, pr_number = pr_info
     pr_data = await fetch_github_pr(owner, repo, pr_number)
-    pr_context = format_pr_context(pr_data)
+    pr_context = format_pr_for_conversation(pr_data)
     pr = pr_data.get("pr", {})
 
     query_map = {
@@ -911,7 +755,17 @@ async def analyze_pr(pr_url: str, analysis_type: str = "full"):
     }
 
     query = query_map.get(analysis_type, query_map["full"])
-    analysis = await analyze_pr_with_ai(pr_context, query, is_structured=True)
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": PR_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{pr_context}\n\n---\n\nUser Request: {query}"}
+        ],
+        max_tokens=2000,
+        temperature=0.3
+    )
+    analysis = response.choices[0].message.content
 
     try:
         parsed = json.loads(analysis)
@@ -933,7 +787,6 @@ async def analyze_pr(pr_url: str, analysis_type: str = "full"):
     }
 
 
-# Direct Commit Analysis endpoint
 @app.post("/analyze-commit")
 async def analyze_commit(commit_url: str):
     """Direct endpoint for commit analysis without chat context."""
@@ -944,7 +797,7 @@ async def analyze_commit(commit_url: str):
 
     owner, repo, commit_sha = commit_info
     commit_data = await fetch_github_commit(owner, repo, commit_sha)
-    commit_context = format_commit_context(commit_data)
+    commit_context = format_commit_for_conversation(commit_data)
     commit = commit_data.get("commit", {})
     commit_info_data = commit.get("commit", {})
     author = commit_info_data.get("author", {})
@@ -990,7 +843,6 @@ async def test_github_pr(owner: str, repo: str, pr_number: int):
         pr_data = await fetch_github_pr(owner, repo, pr_number)
         pr = pr_data.get("pr", {})
 
-        # Build the same metadata as streaming endpoint
         commits = []
         for commit in pr_data.get("commits", [])[:10]:
             commit_info = commit.get("commit", {})
